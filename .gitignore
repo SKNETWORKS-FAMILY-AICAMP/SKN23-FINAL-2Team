@@ -147,3 +147,6 @@ docs/데이터전처리.html
 .gemini/settings.json
 frontend/src/components/setting/ApiKeyManagerModal.tsx
 output_json/*
+docs/database/*
+mcp_server/*
+
