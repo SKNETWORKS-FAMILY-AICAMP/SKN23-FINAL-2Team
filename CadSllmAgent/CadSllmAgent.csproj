@@ -1,0 +1,46 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<TargetFramework>net10.0-windows</TargetFramework>
+		<UseWindowsForms>true</UseWindowsForms>
+		<UseWPF>true</UseWPF>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+<NoWarn>$(NoWarn);3305</NoWarn>
+	</PropertyGroup>
+	<ItemGroup>
+	  <COMReference Include="AXDBLib">
+	    <WrapperTool>tlbimp</WrapperTool>
+	    <VersionMinor>0</VersionMinor>
+	    <VersionMajor>1</VersionMajor>
+	    <Guid>29ff04e4-ea81-477d-98fd-e1efe3fa33a5</Guid>
+	    <Lcid>0</Lcid>
+	    <Isolated>false</Isolated>
+	    <EmbedInteropTypes>true</EmbedInteropTypes>
+	  </COMReference>
+	  <COMReference Include="AutoCAD">
+	    <WrapperTool>tlbimp</WrapperTool>
+	    <VersionMinor>0</VersionMinor>
+	    <VersionMajor>1</VersionMajor>
+	    <Guid>663fb55b-4586-4e88-8269-6a58ec06cb39</Guid>
+	    <Lcid>0</Lcid>
+	    <Isolated>false</Isolated>
+	    <EmbedInteropTypes>true</EmbedInteropTypes>
+	  </COMReference>
+	</ItemGroup>
+	<ItemGroup>
+		<PackageReference Include="AutoCAD.NET" Version="*" ExcludeAssets="runtime" />
+		<PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3065.39" />
+	</ItemGroup>
+	<ItemGroup>
+	  <Reference Include="Autodesk.AutoCAD.Interop">
+	    <HintPath>..\..\..\..\..\..\..\Program Files\Autodesk\AutoCAD 2027\Autodesk.AutoCAD.Interop.dll</HintPath>
+	  </Reference>
+	  <Reference Include="Autodesk.AutoCAD.Interop.Common">
+	    <HintPath>..\..\..\..\..\..\..\Program Files\Autodesk\AutoCAD 2027\Autodesk.AutoCAD.Interop.Common.dll</HintPath>
+	  </Reference>
+	</ItemGroup>
+	<Target Name="CopyWebView2Loader" AfterTargets="Build">
+		<Copy SourceFiles="$(OutDir)runtimes\win-x64\native\WebView2Loader.dll" DestinationFolder="$(OutDir)" Condition="Exists('$(OutDir)runtimes\win-x64\native\WebView2Loader.dll')" />
+	</Target>
+</Project>

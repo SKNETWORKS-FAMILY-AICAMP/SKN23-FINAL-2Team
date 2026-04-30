@@ -1,0 +1,148 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+*.venv
+*venv
+*venv*
+
+.env
+scripts/tunnel.env
+skn23-2team-key.pem
+dump.rdb
+
+
+# --- Visual Studio 관련 ---
+.vs/
+[Bb]in/
+[Obj]/
+*.user
+*.suo
+
+# --- VS Code 관련 ---
+.vscode/
+.history/
+
+# --- 기타 (OS, 언어 등) ---
+node_modules/
+.DS_Store
+Thumbs.db
+
+# --- Python / FastAPI ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.python-version
+
+# --- C# / .NET ---
+obj/
+bin/
+*.dll
+*.pdb
+*.exe
+TestResults/
+*.nupkg
+publish/
+
+# --- Node / React ---
+build/
+.turbo/
+*.tsbuildinfo
+
+# --- AI / ML (파인튜닝, 모델 체크포인트) ---
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+wandb/
+runs/
+checkpoints/
+eval_results/
+outputs/
+mlruns/
+
+# --- 루트 `models/` : 임베딩·리랭커 등 로컬 가중치/HF 캐시 (용량 큼)
+# 주의: backend/models(파이썬 스키마)·CadSllmAgent/Models(C#)는 경로가 달라 영향 없음
+/models/
+
+# --- AI Tools ---
+.forge-log
+.claude/
+.gemini/
+CLAUDE.md
+GEMINI.md
+gemini.md
+
+# --- 도면 관련 ---
+.bak
+.dwl
+.dwl2
+*.dxf
+*.dwg
+
+# --- 데이터셋 / 학습 데이터 ---
+dataset/
+dataset_raw/
+ft01_dataset/
+ft01_dataset_augmented/
+ft01_dataset_test/
+ft01_dataset_train/
+
+# --- 도메인 분류기 임시 산출물 ---
+temp_dxf/
+catboost_info/
+
+# --- Jupyter 체크포인트 ---
+.ipynb_checkpoints/
+
+# --- Vite 자동 생성 캐시 ---
+frontend/.vite/
+
+
+# --- kjw ---
+file_scale.py
+*.bak*
+*.dwl*
+*.dwl2*
+debug_*.json
+generate_test_elec_dxf.py
+
+
+finetune/*
+data/*
+/docs/분류기/*
+scripts/*
+temp_dxf/*
+*.yml
+*.env
+backend/tests/*
+backend/sql/*
+docs/데이터전처리.html
+.gemini/settings.json
+frontend/src/components/setting/ApiKeyManagerModal.tsx

@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "AutoCAD 2027 디버깅": {
+      "commandName": "Executable",
+      "executablePath": "C:\\Program Files\\Autodesk\\AutoCAD 2027\\acad.exe",
+      "commandLineArgs": "/nologo /b \"C:\\Users\\Playdata\\Desktop\\debug.scr\"",
+      "workingDirectory": "C:\\Program Files\\Autodesk\\AutoCAD 2027"
+    }
+  }
+}

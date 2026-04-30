@@ -1,0 +1,33 @@
+# backend/Dockerfile.gpu — NVIDIA GPU가 있는 EC2(g4dn/p3 등) 인스턴스 전용
+# docker-compose.yml의 backend.build.dockerfile 을 이 파일로 변경하거나
+# docker-compose.gpu.yml 오버라이드로 사용.
+#
+# 요구 사항: EC2 호스트에 NVIDIA 드라이버 + nvidia-container-toolkit 설치
+# 참고: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
+
+FROM pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
+
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
+
+ENV HF_HOME=/app/models
+ENV HF_HUB_OFFLINE=1
+ENV TRANSFORMERS_OFFLINE=1
+ENV CUDA_VISIBLE_DEVICES=0
+
+RUN mkdir -p /app/models
+
+RUN pip install --no-cache-dir uv
+
+COPY backend/requirements.txt /app/requirements.txt
+# torch는 이미 베이스 이미지에 포함 — 재설치 방지를 위해 충돌 패키지 제외
+RUN uv pip install --system --no-cache -r /app/requirements.txt \
+    --constraint <(echo "torch==2.0.1") 2>/dev/null || \
+    uv pip install --system --no-cache -r /app/requirements.txt
+
+COPY backend /app/backend
+
+EXPOSE 8000
+
+CMD ["uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

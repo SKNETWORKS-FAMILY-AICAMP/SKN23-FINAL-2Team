@@ -1,0 +1,36 @@
+{
+  "model_name": "XGBoost+PlattScaling",
+  "classes": [
+    "arch",
+    "elec",
+    "fire",
+    "pipe"
+  ],
+  "n_features": 94,
+  "holdout_test_accuracy": 0.7586206896551724,
+  "holdout_vs_previous": {
+    "v2_87dim": 0.7241,
+    "v3_94dim": 0.7586206896551724
+  },
+  "cv_accuracy_mean": 0.8246798200069229,
+  "cv_accuracy_std": 0.026934538078865422,
+  "random_baseline_accuracy": 0.25,
+  "data_source": "dataset_raw (real drawings only)",
+  "n_samples_real": 435,
+  "trained_at": "2026-04-27T17:55:48.118091",
+  "sklearn_version": "1.8.0",
+  "xgboost_version": "3.1.2",
+  "feature_groups": "A-Y (94 dims): W=soft_block_kw(3), X=layer_kw(3), Y=long_line(1)",
+  "xgb_params": {
+    "n_estimators": 300,
+    "max_depth": 4,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "min_child_weight": 3
+  },
+  "platt_scaling": {
+    "cv": 3,
+    "method": "sigmoid"
+  }
+}

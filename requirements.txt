@@ -1,0 +1,66 @@
+# SKN23 backend: direct dependencies only.
+# Last cleaned: 2026-04-24
+# paramiko 는 미사용(코드에서 import 없음), langgraph-sdk 는 미사용.
+# langchain/langchain-community 는 직접 의존 없음 → 설치하지 않음.
+
+# ── API / Runtime ──────────────────────────────────────────────────────────
+APScheduler==3.10.4
+asyncpg==0.29.0
+boto3==1.34.0
+email-validator==2.3.0
+fastapi==0.111.0
+httpx==0.27.0
+openai==1.109.1
+pydantic==2.10.6
+pydantic-settings==2.6.1
+python-dotenv==1.0.1
+python-multipart==0.0.26
+redis==5.0.4
+SQLAlchemy==2.0.29
+sshtunnel==0.4.0
+uvicorn[standard]==0.30.6
+websockets==16.0
+
+# ── DB / Vector ────────────────────────────────────────────────────────────
+pgvector==0.2.4
+psycopg2-binary==2.9.9
+
+# ── LangGraph / LangChain ──────────────────────────────────────────────────
+# langgraph-prebuilt: ToolNode, tools_condition 사용
+# langgraph-checkpoint: 내부 의존
+# langgraph-sdk: 미사용 → 제거
+langgraph==0.2.34
+langgraph-checkpoint==2.1.2
+langgraph-prebuilt==0.2.3
+langchain-core==0.3.84
+langchain-openai==0.2.0
+langfuse==2.53.5
+packaging==24.2
+langchain-text-splitters==0.3.0
+
+# ── Embeddings + Reranker ──────────────────────────────────────────────────
+# FlagEmbedding이 sentence-transformers, scipy, scikit-learn, torchaudio,
+# torchvision, sentencepiece, safetensors 를 자동으로 끌어옴.
+FlagEmbedding==1.2.10
+huggingface-hub==0.30.0
+numpy==1.26.4
+scikit-learn==1.8.0
+scipy==1.11.4
+sentence-transformers==2.7.0
+torch==2.2.2
+transformers==4.51.3
+tokenizers==0.21.4
+joblib==1.5.3
+catboost==1.2.10
+xgboost==2.0.3
+
+# ── Reports / DWG 처리 ────────────────────────────────────────────────────
+ezdxf==1.4.3
+opencv-python-headless==4.10.0.84
+openpyxl==3.1.5
+Pillow==12.2.0
+reportlab==4.2.2
+
+# ── Tests ─────────────────────────────────────────────────────────────────
+pytest==8.3.5
+pytest-asyncio==0.23.8
