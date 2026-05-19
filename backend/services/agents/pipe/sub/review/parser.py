@@ -13,7 +13,7 @@ Modification History :
                             equipment_id = TAG_NAME 우선 → handle 폴백
     - 2026-04-16 (송주엽) : 공통 다중객체 매핑 모듈(common.multi_object_mapper) 연동.
                             map_texts_to_blocks() / async_map_texts_to_blocks() 메서드 추가.
-                            배관 도메인 LayerBonusConfig(L4/TEX) 적용.
+                            배관 도메인 레이어 보너스 설정 적용.
     - 2026-04-23 : CAD_JSON_DEBUG 시 최상위 키·요소 샘플러(handle/type/attributes 키) INFO 로그
     - 2026-04-28 (송주엽) : TextAttributeExtractor 추가 (TEXT 엔티티에서 DN/재질/압력 추출)
                             도면층 기반 매핑 (LayerBasedScoringEngine) 통합.
@@ -59,6 +59,14 @@ _DIM_BLOCK_NAME_RE = re.compile(
     r"치수|DIMTICK|DIM[-_]|^TICK|^CROSS|^ARROW|^CENTER[-_]MARK|"
     r"^_OPEN|^_CLOSED|^_OBLIQUE|^_DOTSMALL|^_DOT|^_INTEGRAL|"
     r"^_ARCH|^_SMALL|ACAD_DIMSTYLE",
+    re.IGNORECASE,
+)
+
+# ④ CIRCLE을 배관 단면으로 자동 승격할 수 있는 레이어 힌트.
+#    표제 도면 참조(circle + "M-04" 등) 오인 방지를 위해 명시적 배관/위생 레이어에 한정한다.
+_PIPE_LAYER_HINT_RE = re.compile(
+    r"^GAS|^P[-_]|^M[-_]|^W[-_]|^SD[-_]|^DR[-_]|"
+    r"PIPE|PIPING|MEP|HVAC|SPRINK|배관|급수|급탕|배수|위생|오수|가스",
     re.IGNORECASE,
 )
 
@@ -111,6 +119,12 @@ class TextAttributeExtractor:
     VELOCITY_PATTERN = re.compile(r"[Vv]\s*[=:]?\s*(\d+(?:\.\d+)?)\s*m/s", re.IGNORECASE)
     HANGER_PATTERN   = re.compile(r"@\s*(\d+(?:\.\d+)?)\s*(?:mm)?(?!\d)", re.IGNORECASE)
     ELEVATION_PATTERN = re.compile(r"(?:FL|EL|GL)\s*[+.\-]\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
+    REDUCER_WORD_PATTERN = re.compile(r"레듀샤|레듀셔|리듀서|REDUCER|이경|축소", re.IGNORECASE)
+    REDUCER_SIZE_PAIR_PATTERN = re.compile(
+        r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:A|DN)?\s*(?:[xX×*]|->|→|-)\s*"
+        r"(\d+(?:\.\d+)?)\s*(?:A|DN)?(?!\d)",
+        re.IGNORECASE,
+    )
 
     @classmethod
     def extract_from_text(cls, text: str) -> dict[str, Any]:
@@ -159,6 +173,17 @@ class TextAttributeExtractor:
         if elev_match:
             attrs["elevation_mm"] = float(elev_match.group(1))
 
+        if cls.REDUCER_WORD_PATTERN.search(text):
+            reducer_match = cls.REDUCER_SIZE_PAIR_PATTERN.search(text)
+            if reducer_match:
+                inlet = float(reducer_match.group(1))
+                outlet = float(reducer_match.group(2))
+                attrs["component_type"] = "reducer"
+                attrs["reducer_sizes_mm"] = [inlet, outlet]
+                attrs["inlet_diameter_mm"] = inlet
+                attrs["outlet_diameter_mm"] = outlet
+                attrs.setdefault("diameter_mm", inlet)
+
         return attrs
 
     @classmethod
@@ -169,8 +194,12 @@ class TextAttributeExtractor:
         """
         changed = False
         _OVERWRITE = {"diameter_mm", "material", "pressure_mpa"}
-        _ADDITIVE  = {"flow_rate_m3h", "temp_c", "velocity_ms",
-                      "hanger_spacing_mm", "elevation_mm"}
+        _ADDITIVE  = {
+            "flow_rate_m3h", "temp_c", "velocity_ms",
+            "hanger_spacing_mm", "elevation_mm",
+            "component_type", "reducer_sizes_mm",
+            "inlet_diameter_mm", "outlet_diameter_mm",
+        }
         for key in _OVERWRITE:
             existing = element.get(key)
             if key in extracted and (not existing or existing == 0 or existing == "UNKNOWN"):
@@ -229,7 +258,7 @@ class ParserAgent:
         promoted_for_pipe = bool(item.get("flag_for_piping_agent")) or str(item.get("layer_role") or "").lower() == "mep"
 
         # ⓪ 통계 기반 레이어 역할 필터링 (arch인 경우 즉시 제외)
-        # 단, L3/L4처럼 레이어 전체는 arch/unknown이어도 유색 배관선·배관 주석으로 승격된 객체는 보존한다.
+        # 단, 레이어 전체는 arch/unknown이어도 유색 배관선·배관 주석으로 승격된 객체는 보존한다.
         if (
             not arch_context
             and layer_resolved_roles
@@ -244,13 +273,9 @@ class ParserAgent:
         if raw_type.upper() in _SKIP_RAW_TYPES:
             return None
             
-        # ② 치수/주석 전용 레이어 제외 (TEX는 배관 주석이므로 제외 대상에서 명시적 보호)
-        if layer:
-            if layer.upper() == "TEX":
-                # TEX 레이어는 무조건 보존
-                pass
-            elif _DIM_LAYER_RE.search(layer):
-                return None
+        # ② 치수/주석 전용 레이어 제외. TEXT 계열은 내용 기반으로 후속 필터가 판단한다.
+        if layer and _DIM_LAYER_RE.search(layer) and raw_type.upper() not in {"TEXT", "MTEXT", "MLEADER", "LEADER"}:
+            return None
 
         attrs = item.get("attributes") or {}
         equipment_id = str(attrs.get("TAG_NAME") or handle)
@@ -299,16 +324,33 @@ class ParserAgent:
             or self._bbox_center(item.get("bbox"))
             or {"x": 0.0, "y": 0.0}
         )
-        diameter_mm = (
-            self._to_float(item.get("diameter"))
-            or self._to_float(item.get("radius", 0)) * 2
-            or self._parse_dn_size(attrs.get("SIZE", ""))
-        )
-        # CIRCLE 단면: radius >= 2.5mm 이면 배관 단면으로 간주
-        if raw_type.upper() == "CIRCLE" and not diameter_mm:
-            r = self._to_float(item.get("radius", 0))
-            if r >= 2.5:
-                diameter_mm = r * 2
+        # CIRCLE 의 기하학적 diameter/radius 는 도면 참조 심볼(표제 원)에도 똑같이 존재하므로
+        # 배관 컨텍스트(promoted/배관 레이어/배관 속성)가 있을 때만 DN 으로 간주한다.
+        # 비배관 컨텍스트의 CIRCLE 은 SIZE 속성에 명시된 DN 만 인정한다.
+        size_dn = self._parse_dn_size(attrs.get("SIZE", ""))
+        if raw_type.upper() == "CIRCLE":
+            has_pipe_attr = any(
+                attrs.get(k) for k in ("SIZE", "DIAMETER", "MATERIAL", "PRESSURE", "TAG_NAME")
+            )
+            is_pipe_circle = bool(
+                promoted_for_pipe
+                or has_pipe_attr
+                or _PIPE_LAYER_HINT_RE.search(layer or "")
+            )
+            if is_pipe_circle:
+                diameter_mm = (
+                    self._to_float(item.get("diameter"))
+                    or self._to_float(item.get("radius", 0)) * 2
+                    or size_dn
+                )
+            else:
+                diameter_mm = size_dn or 0.0
+        else:
+            diameter_mm = (
+                self._to_float(item.get("diameter"))
+                or self._to_float(item.get("radius", 0)) * 2
+                or size_dn
+            )
 
         pressure_mpa = self._to_float(attrs.get("PRESSURE") or item.get("pressure", 0))
         slope_pct    = self._to_float(attrs.get("SLOPE") or item.get("slope", 0))
@@ -341,6 +383,8 @@ class ParserAgent:
             "linetype":     linetype if linetype else None,
             "lineweight":   lineweight,
         }
+        if isinstance(item.get("bbox"), dict):
+            out_el["bbox"] = item["bbox"]
 
         # ── 타입별 추가 필드 ──────────────────────────────────────────────────
         raw_upper = raw_type.upper()
@@ -410,12 +454,21 @@ class ParserAgent:
 
         # MLEADER: 인출선 주석 → TextAttributeExtractor 직접 적용
         elif raw_upper == "MLEADER":
+            if item.get("start"):
+                out_el["start"] = item["start"]
+            if item.get("end"):
+                out_el["end"] = item["end"]
             ml_text = str(item.get("text") or item.get("content") or "")
             if ml_text:
                 out_el["text"] = ml_text
                 extracted = TextAttributeExtractor.extract_from_text(ml_text)
                 if extracted:
                     TextAttributeExtractor.enrich_element(out_el, extracted)
+            if item.get("text_height") is not None:
+                out_el["text_height"] = self._to_float(item.get("text_height"))
+            rotation = item.get("rotation")
+            if rotation is not None:
+                out_el["rotation_deg"] = round(float(rotation), 2)
 
         lr = item.get("layer_role")
         if lr is not None:
@@ -428,6 +481,8 @@ class ParserAgent:
             out_el["entity_mep_score"] = self._to_float(item.get("entity_mep_score"))
         if item.get("entity_mep_indicator") is not None:
             out_el["entity_mep_indicator"] = str(item.get("entity_mep_indicator") or "")
+        if item.get("topology_pipe_evidence") is not None:
+            out_el["topology_pipe_evidence"] = str(item.get("topology_pipe_evidence") or "")
         if item.get("metadata_role") is not None:
             out_el["metadata_role"] = str(item.get("metadata_role") or "")
         if arch_context:
@@ -446,7 +501,7 @@ class ParserAgent:
         입력:
           layout_data  : C# 형식 도면 JSON (str 또는 dict)
           mapping_table: MappingAgent 출력 — term_map, style_map, entity_type_map 포함
-          layer_resolved_roles: (신규) 통계 기반 레이어 역할 맵 (L4, L3 등 모든 레이어 대응)
+          layer_resolved_roles: (신규) 통계 기반 레이어 역할 맵 (프로젝트별 모든 레이어 대응)
 
         반환:
           {

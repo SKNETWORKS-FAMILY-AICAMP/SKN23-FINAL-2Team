@@ -43,6 +43,7 @@ from backend.services.state_service import (
 )
 from backend.services.memory_service import load_session_memory, update_recent_chat, update_summary_text
 from backend.services.graph.nodes.memory_summary_node import (
+    build_combined_memory,
     format_turn_text, split_turns, join_turns, compress_memory,
     MAX_RECENT_TURNS,
 )
@@ -217,6 +218,16 @@ class AgentService:
                             agent_name=f"{str(domain)}_graph",
                             message_metadata=resp_m if resp_m else None,
                         )
+                        await update_recent_chat(
+                            save_db,
+                            session_id,
+                            str(final_state.get("recent_chat") or ""),
+                        )
+                        await update_summary_text(
+                            save_db,
+                            session_id,
+                            str(final_state.get("summary_text") or ""),
+                        )
             except Exception as e:
                 print(f"[run_stream DB 저장 실패] {e}")
 
@@ -346,7 +357,10 @@ class AgentService:
                 or "죄송합니다. 답변을 생성하지 못했습니다."
             )
 
-            if session_id and (summary_text or recent_chat or True):
+            # response_meta를 미리 추출 (session_id 유무와 무관하게 항상 반환)
+            resp_m = result_dict.get("response_meta") or {}
+
+            if session_id:
                 try:
                     async with SessionLocal() as db:
                         from sqlalchemy import text as _text
@@ -379,19 +393,31 @@ class AgentService:
                             message_metadata=resp_m if resp_m else None,
                         )
 
-                        turns = split_turns(recent_chat)
-                        turns.append(format_turn_text(user_text, ai_response))
+                        graph_summary_text = str(result_dict.get("summary_text") or "").strip()
+                        graph_recent_chat = str(result_dict.get("recent_chat") or "").strip()
+                        graph_memory_changed = (
+                            graph_summary_text != (summary_text or "").strip()
+                            or graph_recent_chat != (recent_chat or "").strip()
+                        )
+                        if graph_memory_changed:
+                            summary_text = graph_summary_text
+                            recent_chat = graph_recent_chat
+                        else:
+                            # Defensive fallback for graphs that return an answer without
+                            # running memory_summary_node.
+                            turns = split_turns(recent_chat)
+                            turns.append(format_turn_text(user_text, ai_response))
 
-                        if len(turns) > MAX_RECENT_TURNS:
-                            oldest = turns.pop(0)
-                            roll_llm = ChatOpenAI(
-                                model=settings.OPENAI_MODEL_NAME,
-                                api_key=settings.OPENAI_API_KEY,
-                                temperature=0,
-                            )
-                            summary_text = await compress_memory(roll_llm, summary_text, oldest)
+                            if len(turns) > MAX_RECENT_TURNS:
+                                oldest = turns.pop(0)
+                                roll_llm = ChatOpenAI(
+                                    model=settings.OPENAI_MODEL_NAME,
+                                    api_key=settings.OPENAI_API_KEY,
+                                    temperature=0,
+                                )
+                                summary_text = await compress_memory(roll_llm, summary_text, oldest)
 
-                        recent_chat = join_turns(turns)
+                            recent_chat = join_turns(turns)
                         await update_recent_chat(db, session_id, recent_chat)
                         await update_summary_text(db, session_id, summary_text)
 
@@ -405,6 +431,7 @@ class AgentService:
             final_st: dict = dict(result_dict) if isinstance(result_dict, dict) else {}
             final_st["recent_chat"] = recent_chat
             final_st["summary_text"] = summary_text
+            final_st["combined_memory"] = build_combined_memory(summary_text, recent_chat)
             rr0 = final_st.get("review_result") or {}
             has_pending0 = bool(final_st.get("pending_fixes"))
             has_viols0 = bool((rr0 if isinstance(rr0, dict) else {}).get("violations"))
@@ -426,11 +453,19 @@ class AgentService:
                 except Exception as e:
                     logger.warning("[Chat] REVIEW_RESULT 브로드캐스트 실패: %s", e)
 
-            return ai_response
+            return {
+                "message":       ai_response,
+                "response_meta": resp_m if isinstance(resp_m, dict) else {},
+                "domain":        str(domain),
+            }
 
         except Exception as e:
             print(f"[LLM Error in chat] {str(e)}")
-            return "AI 모델(sLLM)과 통신하는 중 문제가 발생했습니다."
+            return {
+                "message":       "AI 모델(sLLM)과 통신하는 중 문제가 발생했습니다.",
+                "response_meta": {},
+                "domain":        str(domain),
+            }
 
     # --- 내부 헬퍼 메서드 ---
     def _build_initial_state(self, domain, state, payload) -> dict:

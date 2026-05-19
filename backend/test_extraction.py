@@ -8,8 +8,8 @@ Description : CAD에서 추출된 JSON과 정답지를 비교하여 F1 Score를 
 import json
 import time
 import uuid
-from evaluation.kpi_scorer import CADAgentScorer
-from evaluation.schemas import Violation
+from backend.services.evaluation.kpi_score import CADAgentScorer
+from backend.services.evaluation.schemas import Violation
 
 # 1. 공식 스코어러 준비
 scorer = CADAgentScorer()

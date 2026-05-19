@@ -15,6 +15,7 @@ from backend.services.agents.common.object_mapping_utils import (
 
 # 레이어명에서 전선 굵기(SQ) 추출 — "Cable_2.5SQ", "W-4SQ", "E-CABLE-6SQ", "2.5sq" 등
 _SQ_PATTERN = re.compile(r'(\d+(?:\.\d+)?)\s*[Ss][Qq]')
+
 # 레이어명에서 전압(V) 추출 — "220V", "380V", "E-LINE-110V"
 _VOLTAGE_PATTERN = re.compile(r'(\d+(?:\.\d+)?)\s*[Vv](?:\b|$)')
 
@@ -45,10 +46,12 @@ class ParserAgent:
 
         parsed = []
         skipped = 0
-        for idx, item in enumerate(raw_entities):
-            if not isinstance(item, dict): continue
 
-            # handle 없으면 layer+index 기반 합성 ID 생성 (RevCloud 위치 지정은 안 되지만 AI 검토는 가능)
+        for idx, item in enumerate(raw_entities):
+            if not isinstance(item, dict):
+                continue
+
+            # handle 없으면 layer+index 기반 합성 ID 생성
             raw_handle = item.get("handle")
             if raw_handle:
                 handle = str(raw_handle)
@@ -56,10 +59,10 @@ class ParserAgent:
                 layer_hint = str(item.get("layer") or "")[:8]
                 handle = f"__gen_{idx}_{layer_hint}"
 
-            # type 없으면 block_name(→INSERT), layer 접두어(→추론), 없으면 스킵
+            # type 없으면 block_name/effective_name 기준으로 INSERT 추론
             raw_type = item.get("type")
             if not raw_type:
-                block_name_hint = item.get("block_name") or ""
+                block_name_hint = item.get("effective_name") or item.get("block_name") or ""
                 if block_name_hint:
                     raw_type = "INSERT"
                 elif item.get("layer"):
@@ -67,14 +70,32 @@ class ParserAgent:
                 else:
                     skipped += 1
                     continue
-            raw_type = str(raw_type)
-            layer    = str(item.get("layer", ""))
-            attrs    = item.get("attributes") or {}
 
-            equipment_id = str(attrs.get("TAG_NAME") or handle)
-            block_name = str(item.get("block_name") or "")
+            raw_type = str(raw_type)
+            layer = str(item.get("layer", ""))
+            attrs = item.get("attributes") or {}
+
+            # 동적 블록 대응: effective_name 우선 사용
+            effective_name = str(item.get("effective_name") or "")
+            raw_block_name = str(item.get("block_name") or "")
+            block_name = effective_name or raw_block_name
+
+            # 기구번호/장비 ID 추출 보강
+            equipment_id = str(
+                attrs.get("TAG_NAME")
+                or attrs.get("TAG")
+                or attrs.get("ID")
+                or attrs.get("DEVICE_ID")
+                or attrs.get("EQUIPMENT_ID")
+                or attrs.get("MARK")
+                or attrs.get("NAME")
+                or handle
+            )
+
             resolved_type = (
                 term_map.get(block_name)
+                or term_map.get(raw_block_name)
+                or term_map.get(effective_name)
                 or term_map.get(layer)
                 or entity_type_map.get(raw_type.upper())
                 or raw_type
@@ -89,18 +110,26 @@ class ParserAgent:
             )
 
             # 전압: 속성 → 아이템 필드 → 레이어명 순으로 폴백
-            voltage = self._to_float(attrs.get("VOLTAGE") or item.get("voltage", 0))
+            voltage = self._to_float(
+                attrs.get("VOLTAGE")
+                or attrs.get("V")
+                or item.get("voltage", 0)
+            )
             if not voltage:
                 voltage = _voltage_from_layer(layer)
 
             # 전선 굵기(SQ): 속성 → 아이템 필드 → 레이어명 순으로 폴백
             cable_sqmm = self._to_float(
-                attrs.get("CABLE_SQ") or attrs.get("SQ") or item.get("sqmm", 0)
+                attrs.get("CABLE_SQ")
+                or attrs.get("SQ")
+                or attrs.get("SQMM")
+                or attrs.get("WIRE_SIZE")
+                or item.get("sqmm", 0)
             )
             if not cable_sqmm:
                 cable_sqmm = _sq_from_layer(layer)
 
-            # 레이어명에서 파싱한 값을 attributes에도 주입해 AI가 바로 읽을 수 있게 함
+            # 레이어명에서 파싱한 값을 attributes에도 주입
             enriched_attrs = dict(attrs)
             if cable_sqmm and not enriched_attrs.get("SQ"):
                 enriched_attrs["SQ"] = str(cable_sqmm)
@@ -108,20 +137,35 @@ class ParserAgent:
                 enriched_attrs["VOLTAGE"] = str(voltage)
 
             el_dict: dict = {
-                "id":           handle,
-                "handle":       handle,
-                "tag_name":     equipment_id,
-                "type":         resolved_type,
-                "raw_type":     raw_type,
-                "layer":        layer,
-                "position":     position,
-                "voltage":      voltage,
-                "cable_sqmm":   cable_sqmm,
-                "attributes":   enriched_attrs,
+                "id": handle,
+                "handle": handle,
+                "block_name": raw_block_name,
+                "effective_name": effective_name,
+                "tag_name": equipment_id,
+                "type": resolved_type,
+                "raw_type": raw_type,
+                "layer": layer,
+                "position": position,
+                "voltage": voltage,
+                "cable_sqmm": cable_sqmm,
+                "attributes": enriched_attrs,
             }
+            for meta_key in (
+                "electric_review_scope",
+                "analysis_role",
+                "drawing_role",
+                "analysis_scope",
+                "topology_candidate",
+                "compliance_candidate",
+                "cad_delete_candidate",
+                "domain",
+            ):
+                if meta_key in item:
+                    el_dict[meta_key] = item.get(meta_key)
 
-            # LINE/ARC 타입은 끝점(start, end)을 보존 — topology builder가 연결성 분석에 필수
-            if raw_type.upper() in ("LINE", "ARC", "POLYLINE", "LWPOLYLINE"):
+            # LINE/ARC/POLYLINE 좌표는 topology builder가 사용할 수 있도록 보존
+            raw_upper = raw_type.upper()
+            if raw_upper == "LINE":
                 if item.get("start"):
                     el_dict["start"] = item["start"]
                 if item.get("end"):
@@ -130,6 +174,79 @@ class ParserAgent:
                     el_dict["length"] = item["length"]
                 if item.get("vertices"):
                     el_dict["vertices"] = item["vertices"]
+                if item.get("angle") is not None:
+                    el_dict["angle"] = self._to_float(item.get("angle"))
+
+            elif raw_upper in ("POLYLINE", "LWPOLYLINE"):
+                if item.get("vertices"):
+                    el_dict["vertices"] = item["vertices"]
+                if item.get("points"):
+                    el_dict["points"] = item["points"]
+                if item.get("start"):
+                    el_dict["start"] = item["start"]
+                if item.get("end"):
+                    el_dict["end"] = item["end"]
+                if item.get("length") is not None:
+                    el_dict["length"] = item["length"]
+                if item.get("is_closed") is not None:
+                    el_dict["is_closed"] = bool(item.get("is_closed"))
+                if item.get("area") is not None:
+                    el_dict["area"] = self._to_float(item.get("area"))
+
+            elif raw_upper == "ARC":
+                if item.get("center"):
+                    el_dict["center"] = item["center"]
+                if item.get("start"):
+                    el_dict["start"] = item["start"]
+                if item.get("end"):
+                    el_dict["end"] = item["end"]
+                radius = self._to_float(item.get("radius", 0))
+                if radius:
+                    el_dict["radius"] = radius
+                if item.get("start_angle") is not None:
+                    el_dict["start_angle"] = self._to_float(item.get("start_angle"))
+                if item.get("end_angle") is not None:
+                    el_dict["end_angle"] = self._to_float(item.get("end_angle"))
+                if item.get("length") is not None:
+                    el_dict["length"] = item["length"]
+
+            elif raw_upper == "CIRCLE":
+                if item.get("center"):
+                    el_dict["center"] = item["center"]
+                radius = self._to_float(item.get("radius", 0))
+                if radius:
+                    el_dict["radius"] = radius
+
+            elif raw_upper == "DIMENSION":
+                text = item.get("text") or item.get("content")
+                raw_measurement = item.get("measurement")
+                measurement = self._to_float(raw_measurement)
+                if not measurement and raw_measurement is not None:
+                    measurement = self._dimension_value_from_text(str(raw_measurement))
+                if not measurement and text is not None:
+                    measurement = self._dimension_value_from_text(str(text))
+                if measurement:
+                    el_dict["measurement"] = measurement
+                start = item.get("start") or item.get("xline1_point")
+                end = item.get("end") or item.get("xline2_point")
+                if start:
+                    el_dict["start"] = start
+                if end:
+                    el_dict["end"] = end
+                if text is not None:
+                    el_dict["text"] = str(text)
+
+            elif raw_upper in ("TEXT", "MTEXT"):
+                text = item.get("text") or item.get("content")
+                if text is not None:
+                    el_dict["text"] = str(text)
+                insert_point = item.get("insert_point") or item.get("insert")
+                if insert_point:
+                    el_dict["insert_point"] = insert_point
+                if item.get("text_height") is not None:
+                    el_dict["text_height"] = self._to_float(item.get("text_height"))
+                if item.get("rotation") is not None:
+                    el_dict["rotation"] = self._to_float(item.get("rotation"))
 
             parsed.append(el_dict)
 
@@ -137,7 +254,9 @@ class ParserAgent:
 
     @staticmethod
     def _bbox_center(bbox: dict | None) -> dict | None:
-        if not isinstance(bbox, dict): return None
+        if not isinstance(bbox, dict):
+            return None
+
         try:
             return {
                 "x": (float(bbox["x1"]) + float(bbox["x2"])) / 2,
@@ -145,8 +264,6 @@ class ParserAgent:
             }
         except (KeyError, TypeError, ValueError):
             return None
-
-    # ── 다중 객체 매핑 (공통 유틸 사용) ─────────────────────────────────────────
 
     async def async_map_texts_to_blocks(
         self,
@@ -156,12 +273,7 @@ class ParserAgent:
         ambiguity_threshold: float = 10.0,
     ) -> list[dict]:
         """
-        (비동기) 텍스트 → 전기 블록 매핑 + 모호 케이스 LLM fallback.
-        OOM 방지 전역 세마포어 및 label 필드 포함.
-
-        Returns
-        -------
-        [{"text_handle", "block_handle", "label", "score", "method"}, ...]
+        텍스트와 전기 블록 매핑 + 모호 케이스 LLM fallback.
         """
         return await _map_texts_to_blocks_util(
             text_entities,
@@ -176,8 +288,22 @@ class ParserAgent:
         try:
             return float(
                 str(value)
-                .replace("V", "").replace("kV", "").replace("SQ", "")
-                .replace("sqmm", "").replace("A", "").strip()
+                .replace("kV", "")
+                .replace("KV", "")
+                .replace("V", "")
+                .replace("v", "")
+                .replace("SQMM", "")
+                .replace("sqmm", "")
+                .replace("SQ", "")
+                .replace("sq", "")
+                .replace("A", "")
+                .replace("a", "")
+                .strip()
             )
         except (ValueError, TypeError):
             return 0.0
+
+    @staticmethod
+    def _dimension_value_from_text(text: str) -> float:
+        match = re.search(r"[-+]?\d+(?:\.\d+)?", text or "")
+        return float(match.group(0)) if match else 0.0

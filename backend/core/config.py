@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     DB_NAME: str = "postgres"
     DB_USER: str = "postgres"
     DB_PASSWORD: str = ""
+    DB_POOL_SIZE: int | None = None
+    DB_MAX_OVERFLOW: int | None = None
+    DB_POOL_TIMEOUT: int = 20
+    SSH_DB_POOL_SIZE: int = 6
+    SSH_DB_MAX_OVERFLOW: int = 2
 
     AWS_ACCESS_KEY_ID: str | None = None
     AWS_SECRET_ACCESS_KEY: str | None = None
@@ -74,6 +79,18 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str | None = None
     OPENAI_MODEL_NAME: str = "gpt-4o-mini"
 
+    # KPI: 실시간 LLM-as-Judge precision 측정. MVP에선 GPT 를 심판으로 두고 골든셋 시드 누적.
+    # sLLM 단독 production 으로 가면 self-judge 가 되어 의미 약화 → False 로 두고 self-consistency 로 대체.
+    EVAL_LLM_JUDGE_ENABLED: bool = False
+    EVAL_LLM_JUDGE_MODEL: str = "gpt-4o-mini"
+    EVAL_LLM_JUDGE_MAX_SAMPLE: int = 3   # 도면당 최대 N건만 심판 호출 (비용 통제)
+
+    # KPI: sLLM 단독 시대용 self-consistency precision. N회 동일 도면 호출 후 합의 비율.
+    # 활성화 시 비용 N배. judge / self-consistency 둘 중 하나만 켜는 것을 권장.
+    EVAL_SELF_CONSISTENCY_ENABLED: bool = False
+    EVAL_SELF_CONSISTENCY_RUNS: int = 3   # 추가 호출 횟수 (총 N+1 회 = primary + 추가)
+    EVAL_SELF_CONSISTENCY_QUORUM: int = 2 # 다수결 임계 (N+1 회 중 이 횟수 이상 등장하면 합의)
+
     # 배관 검토: 휴리스틱 unknown 레이어를 MEP 검토 풀에 합칠지(False면 오검↓·누락↑)
     PIPING_REVIEW_INCLUDE_UNKNOWN: bool = True
     PIPING_SPATIAL_HINTS_MAX: int = 32
@@ -94,6 +111,8 @@ class Settings(BaseSettings):
     # RAG: 시방 PDF 앞부목·목차 표가 질의어(배관·자재·시공 등)와 잘 겹쳐 상위에만 걸리는 것 완화
     RAG_FILTER_TOC_HEURISTIC: bool = True
     RAG_QUERY_PREFETCH_CAP: int = 64
+    PIPE_RAG_MAX_CONCURRENT: int = 4
+    PIPE_RAG_SSH_MAX_CONCURRENT: int = 4
 
     @property
     def REDIS_URL(self) -> str:

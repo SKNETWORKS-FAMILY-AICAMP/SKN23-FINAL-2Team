@@ -6,19 +6,107 @@ Langfuse 인프라 모듈
 
 import os
 import time
+import logging
 from functools import wraps
-from dotenv import load_dotenv
-from langfuse import Langfuse
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        return False
+
+try:
+    from langfuse import Langfuse
+except ImportError:
+    Langfuse = None  # type: ignore[assignment]
 
 # .env 명시적 로드 (os.getenv가 pydantic-settings보다 먼저 실행될 수 있음)
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
+class _NoopLangfuseTrace:
+    def generation(self, *args, **kwargs):
+        return None
+
+    def score(self, *args, **kwargs):
+        return None
+
+    def update(self, *args, **kwargs):
+        return None
+
+
+class _NoopLangfuseClient:
+    def trace(self, *args, **kwargs):
+        return _NoopLangfuseTrace()
+
+    def flush(self, *args, **kwargs):
+        return None
+
+
+class _SafeLangfuseTrace:
+    def __init__(self, trace):
+        self._trace = trace
+
+    def _call(self, method_name: str, *args, **kwargs):
+        try:
+            method = getattr(self._trace, method_name, None)
+            if method is None:
+                return None
+            return method(*args, **kwargs)
+        except Exception as exc:
+            logger.warning("[Langfuse] trace.%s failed: %s", method_name, exc)
+            return None
+
+    def generation(self, *args, **kwargs):
+        return self._call("generation", *args, **kwargs)
+
+    def score(self, *args, **kwargs):
+        return self._call("score", *args, **kwargs)
+
+    def update(self, *args, **kwargs):
+        return self._call("update", *args, **kwargs)
+
+
+class _SafeLangfuseClient:
+    def __init__(self, client):
+        self._client = client
+
+    def trace(self, *args, **kwargs):
+        try:
+            trace = self._client.trace(*args, **kwargs)
+            if trace is None:
+                return _NoopLangfuseTrace()
+            return _SafeLangfuseTrace(trace)
+        except Exception as exc:
+            logger.warning("[Langfuse] trace creation failed: %s", exc)
+            return _NoopLangfuseTrace()
+
+    def flush(self, *args, **kwargs):
+        try:
+            return self._client.flush(*args, **kwargs)
+        except Exception as exc:
+            logger.warning("[Langfuse] flush failed: %s", exc)
+            return None
+
+
+def _build_langfuse_client():
+    public_key = os.getenv("LANGFUSE_PUBLIC_KEY", "").strip()
+    secret_key = os.getenv("LANGFUSE_SECRET_KEY", "").strip()
+    host = os.getenv("LANGFUSE_HOST", "http://localhost:3000").strip() or "http://localhost:3000"
+    if not public_key or not secret_key or Langfuse is None:
+        return _NoopLangfuseClient()
+    try:
+        return _SafeLangfuseClient(
+            Langfuse(host=host, public_key=public_key, secret_key=secret_key)
+        )
+    except Exception as exc:
+        logger.warning("[Langfuse] client initialization failed: %s", exc)
+        return _NoopLangfuseClient()
+
+
 # ── 싱글턴 클라이언트 ──
-langfuse_client = Langfuse(
-    host=os.getenv("LANGFUSE_HOST", "http://localhost:3000"),
-    public_key=os.getenv("LANGFUSE_PUBLIC_KEY", ""),
-    secret_key=os.getenv("LANGFUSE_SECRET_KEY", ""),
-)
+langfuse_client = _build_langfuse_client()
 
 
 # ── sub-agent 트래킹 데코레이터 ──

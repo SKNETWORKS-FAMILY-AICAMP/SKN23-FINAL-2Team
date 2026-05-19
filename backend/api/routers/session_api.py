@@ -99,8 +99,7 @@ async def delete_session(
 ):
     """세션과 관련 데이터(메시지, 검토 결과)를 모두 삭제합니다."""
     await require_session_org(db, session_id, auth_org_id)
-    await db.execute(text("DELETE FROM chat_messages   WHERE session_id = :sid"), {"sid": session_id})
-    await db.execute(text("DELETE FROM review_results  WHERE session_id = :sid"), {"sid": session_id})
+    # chat_messages, review_results는 FK CASCADE로 자동 삭제됨
     result = await db.execute(text("DELETE FROM chat_sessions WHERE id = :sid"), {"sid": session_id})
     await db.commit()
     if result.rowcount == 0:

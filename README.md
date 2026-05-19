@@ -15,40 +15,40 @@
 <br><br>
 
 # 1. 팀 소개 
-## ✦ 팀 명 : **Cadence AI** <img src="https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExNHJndXN6eHpsZnZ6Z3Z6Z3Z6Z3Z6Z3Z6Z3Z6Z3Z6Z3Z6Z3Z6Z3Z6JmVwPXYxX2ludGVybmFsX2dpZl9ieV9pZCZjdD1n/3o7TKtnuHOHR9jzY2s/giphy.gif" width="60" align="absmiddle">
+## ✦ 팀 명 : **Cadence AI** 
 
 <div align="center">
   <table width="100%" style="border-collapse: collapse; text-align: center; font-size: 14px; margin: auto; table-layout: fixed;">
   <tr>
       <td width="20%" align="center" style="border: 1px solid #ddd; padding: 10px; vertical-align: middle;">
-        <img src="https://github.com/clachic00.png" width="120" height="120" alt="양창일" style="border-radius: 50%;" />
+        <img src="./frontend/src/assets/rm/b.png" width ="100%" >
       </td>
       <td width="20%" align="center" style="border: 1px solid #ddd; padding: 10px; vertical-align: middle;">
-        <img src="https://github.com/tree0327.png" width="120" height="120" alt="김다빈" style="border-radius: 50%;" />
+         <img src="./frontend/src/assets/rm/d.png" width ="100%" >
       </td>
       <td width="20%" align="center" style="border: 1px solid #ddd; padding: 10px; vertical-align: middle;">
-        <img src="https://github.com/jooooww.png" width="120" height="120" alt="김지우" style="border-radius: 50%;" />
+        <img src="./frontend/src/assets/rm/e.png" width ="100%" >
       </td>
       <td width="20%" align="center" style="border: 1px solid #ddd; padding: 10px; vertical-align: middle;">
-        <img src="https://github.com/JUYEOP024.png" width="120" height="120" alt="송주엽" style="border-radius: 50%;" />
+         <img src="./frontend/src/assets/rm/a.png" width ="100%" >
       </td>
       <td width="20%" align="center" style="border: 1px solid #ddd; padding: 10px; vertical-align: middle;">
-        <img src="https://github.com/minjeong-kim-dev.png" width="120" height="120" alt="김민정" style="border-radius: 50%;" />
+        <img src="./frontend/src/assets/rm/c.png" width ="100%" >
       </td>
   </tr>
   <tr style="background-color: #f9f9f9; font-weight: bold;">
     <td style="border: 1px solid #ddd; padding: 8px;">양창일</td>
     <td style="border: 1px solid #ddd; padding: 8px;">김다빈</td>
+    <td style="border: 1px solid #ddd; padding: 8px;">김민정</td>
     <td style="border: 1px solid #ddd; padding: 8px;">김지우</td>
     <td style="border: 1px solid #ddd; padding: 8px;">송주엽</td>
-    <td style="border: 1px solid #ddd; padding: 8px;">김민정</td>
   </tr>
   <tr style="background-color: #ffffff; font-weight: bold;">
     <td style="border: 1px solid #ddd; padding: 8px; color: #555;"><span style="font-size: 13px; font-weight: bold;">PM/AI/BE</span></td>
     <td style="border: 1px solid #ddd; padding: 8px; color: #555;"><span style="font-size: 13px; font-weight: bold;">APM/AI/BE</span></td>
+    <td style="border: 1px solid #ddd; padding: 8px; color: #555;"><span style="font-size: 13px; font-weight: bold;">AI/FE</span></td>
     <td style="border: 1px solid #ddd; padding: 8px; color: #555;"><span style="font-size: 13px; font-weight: bold;">AI/BE/FE</span></td>
     <td style="border: 1px solid #ddd; padding: 8px; color: #555;"><span style="font-size: 13px; font-weight: bold;">AI/BE/FE/Infra</span></td>
-    <td style="border: 1px solid #ddd; padding: 8px; color: #555;"><span style="font-size: 13px; font-weight: bold;">AI/FE</span></td>
   </tr>
   <tr>
     <td style="border: 1px solid #ddd; padding: 12px 10px; color: #555; vertical-align: top;">
@@ -67,6 +67,12 @@
     </td>
     <td style="border: 1px solid #ddd; padding: 12px 10px; color: #555; vertical-align: top;">
           <div style="font-size: 10px; text-align: left; line-height: 1.5;">
+              - WEB UI/UX<br>
+              - 소방 에이전트 설계<br>
+          </div>
+    </td>
+    <td style="border: 1px solid #ddd; padding: 12px 10px; color: #555; vertical-align: top;">
+          <div style="font-size: 10px; text-align: left; line-height: 1.5;">
               - C# ↔ Python Interop 설계<br>
               - 전기 에이전트 설계<br>
               - AutoCAD UI/UX/Plugin 설계 및 구현<br>
@@ -79,12 +85,6 @@
               - 배관 에이전트 설계
           </div>
     </td>
-    <td style="border: 1px solid #ddd; padding: 12px 10px; color: #555; vertical-align: top;">
-          <div style="font-size: 10px; text-align: left; line-height: 1.5;">
-              - WEB UI/UX<br>
-              - 소방 에이전트 설계<br>
-          </div>
-    </td>
   </tr>
   <tr style="background-color: #ffffff;">
     <td align="center" style="border: 1px solid #ddd; padding: 8px;">
@@ -94,13 +94,13 @@
         <a href="https://github.com/tree0327"><img src="https://img.shields.io/badge/GitHub-tree0327-pink?logo=github"></a>
     </td>
     <td align="center" style="border: 1px solid #ddd; padding: 8px;">
+        <a href="https://github.com/minjeong-kim-dev"><img src="https://img.shields.io/badge/GitHub-minjeong--kim--dev-orange?logo=github"></a>
+    </td>
+    <td align="center" style="border: 1px solid #ddd; padding: 8px;">
         <a href="https://github.com/jooooww"><img src="https://img.shields.io/badge/GitHub-jooooww-black?logo=github"></a>
     </td>
     <td align="center" style="border: 1px solid #ddd; padding: 8px;">
         <a href="https://github.com/JUYEOP024"><img src="https://img.shields.io/badge/GitHub-JUYEOP024-green?logo=github"></a>
-    </td>
-    <td align="center" style="border: 1px solid #ddd; padding: 8px;">
-        <a href="https://github.com/minjeong-kim-dev"><img src="https://img.shields.io/badge/GitHub-minjeong--kim--dev-orange?logo=github"></a>
     </td>
   </tr>
 </table>

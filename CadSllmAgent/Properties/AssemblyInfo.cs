@@ -34,5 +34,6 @@ using Autodesk.AutoCAD.Runtime;
 [assembly: AssemblyFileVersion("1.0.0.0")]
 
 // AutoCAD 명령 등록(플러그인 DLL 로드 시)
+[assembly: ExtensionApplication(typeof(CadSllmAgent.PluginEntry))]
 [assembly: CommandClass(typeof(CadSllmAgent.commands.AgentCommands))]
 [assembly: CommandClass(typeof(CadSllmAgent.Review.DemoReviewCommand))]

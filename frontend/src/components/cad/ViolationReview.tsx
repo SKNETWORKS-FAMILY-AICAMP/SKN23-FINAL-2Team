@@ -4,11 +4,18 @@ import {
   Check,
   ChevronRight,
   Eye,
-  MousePointerClick,
+  Layers,
   X,
 } from "lucide-react";
 import { C } from "../../constants/theme";
 import { labelForAutoFixType } from "../../utils/cadUtils";
+import type { CreationProposal } from "../../store/agentStore";
+
+function isDrawingQaViolation(v: any) {
+  const source = v?._source || v?.source;
+  const kind = String(v?.violation_type || v?.issue_type || "");
+  return source === "drawing_qa" || kind.startsWith("drawing_quality_");
+}
 
 export function ViolationDetailModal({
   ent,
@@ -22,6 +29,7 @@ export function ViolationDetailModal({
   const vid = v?.id != null && v.id !== "" ? String(v.id) : null;
   const isRes = vid ? resolved.has(vid) : true;
   const fixLabel = labelForAutoFixType(ent);
+  const isQaIssue = isDrawingQaViolation(v);
 
   const severityColor: Record<string, string> = {
     Critical: "#ef4444",
@@ -62,11 +70,23 @@ export function ViolationDetailModal({
                 {v.severity}
               </span>
             )}
+            {isQaIssue && (
+              <span
+                className="shrink-0 whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-bold"
+                style={{
+                  background: "rgba(234,179,8,0.14)",
+                  color: "#fde68a",
+                  border: "1px solid rgba(234,179,8,0.45)",
+                }}
+              >
+                QA 이슈
+              </span>
+            )}
             <span
               className="truncate text-[13px] font-semibold"
               style={{ color: C.textPrimary }}
             >
-              {v?.rule || v?.description || "위반 항목"}
+              {v?.description || v?.rule || "위반 항목"}
             </span>
           </div>
 
@@ -216,6 +236,105 @@ export function ViolationDetailModal({
   );
 }
 
+const PROPOSAL_THEME = {
+  create:  { accent: "#0ea5e9", border: "rgba(14,165,233,0.25)", bg: "rgba(14,165,233,0.05)", badge: "#7dd3fc", label: "새 객체 생성", icon: "✦" },
+  replace: { accent: "#f97316", border: "rgba(249,115,22,0.3)",  bg: "rgba(249,115,22,0.05)", badge: "#fdba74", label: "객체 교체",    icon: "⇄" },
+  modify:  { accent: "#eab308", border: "rgba(234,179,8,0.3)",   bg: "rgba(234,179,8,0.05)",  badge: "#fde68a", label: "속성 수정",    icon: "✎" },
+};
+
+export function CreationProposalPane({
+  proposals,
+  onApprove,
+  onReject,
+}: {
+  proposals: CreationProposal[];
+  onApprove: (proposalId: string) => void;
+  onReject: (proposalId: string, handles: string[]) => void;
+}) {
+  if (!proposals || proposals.length === 0) return null;
+
+  return (
+    <section className="mb-3 space-y-2">
+      {proposals.map((p) => {
+        const theme = PROPOSAL_THEME[p.proposal_type ?? "create"] ?? PROPOSAL_THEME.create;
+        return (
+          <div
+            key={p.proposal_id}
+            className="overflow-hidden rounded-xl"
+            style={{ background: theme.bg, border: `1px solid ${theme.border}` }}
+          >
+            {/* 헤더 */}
+            <div
+              className="flex items-center gap-2 px-3 py-2"
+              style={{ borderBottom: `1px solid ${theme.border}`, background: `${theme.accent}0d` }}
+            >
+              <span className="text-[13px]" style={{ color: theme.accent }}>{theme.icon}</span>
+              <span className="text-[11px] font-bold whitespace-nowrap" style={{ color: theme.badge }}>
+                {theme.label}
+              </span>
+              <span className="text-[11px] font-semibold truncate" style={{ color: C.textPrimary }}>
+                {p.count != null ? `${p.count}개 객체` : ""}
+              </span>
+              {p.layers.length > 0 && (
+                <div className="flex flex-wrap gap-1 ml-auto shrink-0">
+                  {p.layers.map((l) => (
+                    <span
+                      key={l}
+                      className="rounded px-1.5 py-0.5 text-[10px] whitespace-nowrap"
+                      style={{ background: `${theme.accent}20`, color: theme.badge, border: `1px solid ${theme.accent}40` }}
+                    >
+                      {l}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* 본문 */}
+            <div className="px-3 py-2">
+              <p className="text-[12px] leading-relaxed" style={{ color: C.textSub }}>
+                {p.description}
+              </p>
+
+              {p.proposal_type === "replace" && (
+                <p className="mt-1 text-[11px]" style={{ color: "#fdba74" }}>
+                  기존 {p.delete_count ?? 0}개 삭제 후 신규 {p.count}개로 교체됩니다.
+                </p>
+              )}
+            </div>
+
+            {/* 액션 버튼 */}
+            <div
+              className="flex items-center justify-end gap-2 px-3 py-2"
+              style={{ borderTop: `1px solid ${theme.border}` }}
+            >
+              <span className="mr-auto text-[10px]" style={{ color: C.textMuted }}>
+                {p.proposal_type === "create"  && "승인 시 도면에 유지 · 취소 시 삭제"}
+                {p.proposal_type === "replace" && "승인 시 교체 확정"}
+                {p.proposal_type === "modify"  && "승인 시 CAD에 즉시 반영"}
+              </span>
+              <button
+                onClick={() => onReject(p.proposal_id, p.handles)}
+                className="rounded px-3 py-1 text-[11px] transition-colors hover:bg-red-900/20"
+                style={{ color: "#fca5a5", border: "1px solid rgba(248,113,113,0.3)" }}
+              >
+                취소
+              </button>
+              <button
+                onClick={() => onApprove(p.proposal_id)}
+                className="rounded px-3 py-1.5 text-[11px] font-semibold text-white transition-transform active:scale-95"
+                style={{ background: theme.accent }}
+              >
+                승인
+              </button>
+            </div>
+          </div>
+        );
+      })}
+    </section>
+  );
+}
+
 export function ViolationPane({
   violations,
   resolved,
@@ -224,6 +343,9 @@ export function ViolationPane({
   onZoom,
   onApproveAll,
   onRejectAll,
+  pendingProposals = [],
+  onApproveProposal,
+  onRejectProposal,
 }: any) {
   const [detailEnt, setDetailEnt] = useState<any>(null);
   const [reviewListMode, setReviewListMode] = useState<"pending" | "completed">("pending");
@@ -236,13 +358,21 @@ export function ViolationPane({
       return { ent, idx, vid, isRes };
     });
 
-    const keyOf = (v: any) =>
-      `${v?.rule || ""}|||${v?.description || ""}|||${v?.suggestion || ""}`;
+    const keyOf = (row: any) => {
+      const v = row.ent?.violation;
+      return [
+        row.vid || "",
+        row.ent?.handle || "",
+        v?.rule || "",
+        v?.description || "",
+        v?.suggestion || "",
+      ].join("|||");
+    };
 
     const map = new Map<string, typeof rows>();
 
     for (const row of rows) {
-      const key = keyOf(row.ent.violation);
+      const key = keyOf(row);
       if (!map.has(key)) map.set(key, []);
       map.get(key)!.push(row);
     }
@@ -263,10 +393,23 @@ export function ViolationPane({
   );
   const visibleGroups = reviewListMode === "completed" ? completedGroups : pendingGroups;
 
+  const hasProposals = Array.isArray(pendingProposals) && pendingProposals.length > 0;
+
   if (!violations || violations.length === 0) {
     return (
-      <div className="p-4 text-center text-[12px]" style={{ color: C.textMuted }}>
-        검토·수정 대기 항목이 없습니다.
+      <div className="p-4">
+        {hasProposals && onApproveProposal && onRejectProposal && (
+          <CreationProposalPane
+            proposals={pendingProposals}
+            onApprove={onApproveProposal}
+            onReject={onRejectProposal}
+          />
+        )}
+        {!hasProposals && (
+          <div className="text-center text-[12px]" style={{ color: C.textMuted }}>
+            검토·수정 대기 항목이 없습니다.
+          </div>
+        )}
       </div>
     );
   }
@@ -276,8 +419,7 @@ export function ViolationPane({
     major: list.filter((x: any) => x.ent.violation?.severity === "Major").length,
     minor: list.filter((x: any) => x.ent.violation?.severity === "Minor").length,
     qa: list.filter((x: any) => {
-      const source = x.ent.violation?._source || x.ent.violation?.source;
-      return source === "drawing_qa";
+      return isDrawingQaViolation(x.ent.violation);
     }).length,
   };
   const resolvedCount = completed.length;
@@ -302,6 +444,14 @@ export function ViolationPane({
           border: `1px solid ${C.border}`,
         }}
       >
+        {hasProposals && onApproveProposal && onRejectProposal && (
+          <CreationProposalPane
+            proposals={pendingProposals}
+            onApprove={onApproveProposal}
+            onReject={onRejectProposal}
+          />
+        )}
+
         <section
           className="rounded-xl p-3"
           style={{
@@ -407,10 +557,11 @@ export function ViolationPane({
               const isResolved = items.every((x: any) => x.isRes);
               const vid = first.vid;
               const fixLabel = labelForAutoFixType(first.ent);
+              const isQaIssue = isDrawingQaViolation(v);
 
               return (
                 <button
-                  key={`${key}-${index}`}
+                  key={key}
                   onClick={() => setDetailEnt(first.ent)}
                   className="rounded-xl p-3 text-left transition hover:ring-1 hover:ring-blue-500/50"
                   style={{
@@ -420,9 +571,34 @@ export function ViolationPane({
                   }}
                 >
                   <div className="flex items-start justify-between gap-2">
-                    <div>
+                    <div className="min-w-0">
+                      <div className="mb-1 flex flex-wrap items-center gap-1.5">
+                        {isQaIssue && (
+                          <span
+                            className="shrink-0 whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-bold"
+                            style={{
+                              background: "rgba(234,179,8,0.14)",
+                              color: "#fde68a",
+                              border: "1px solid rgba(234,179,8,0.45)",
+                            }}
+                          >
+                            QA 이슈
+                          </span>
+                        )}
+                        {fixLabel && (
+                          <span
+                            className="rounded border px-1.5 py-0.5 text-[10px]"
+                            style={{
+                              borderColor: C.border,
+                              color: C.textSub,
+                            }}
+                          >
+                            {fixLabel}
+                          </span>
+                        )}
+                      </div>
                       <p className="text-[12px] font-semibold" style={{ color: C.textPrimary }}>
-                        {v?.rule || v?.description || `수정 제안 ${index + 1}`}
+                        {v?.description || v?.rule || `수정 제안 ${index + 1}`}
                       </p>
                       {v?.suggestion && (
                         <p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-slate-400">
@@ -431,7 +607,17 @@ export function ViolationPane({
                       )}
                     </div>
 
-                    <Eye className="h-4 w-4 shrink-0 text-blue-400" />
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onZoom(first.ent);
+                      }}
+                      className="rounded p-0.5 text-blue-400 hover:text-blue-300 hover:bg-blue-400/10 transition-colors"
+                      title="줌인"
+                    >
+                      <Eye className="h-4 w-4 shrink-0" />
+                    </button>
                   </div>
 
                   {reviewListMode === "completed" ? (

@@ -1,0 +1,125 @@
+# docker-compose.yml — EC2 배포용 (로컬 개발에서도 동일하게 사용 가능)
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# 사전 준비
+#   1) cp .env.example .env  → 각 값 설정
+#   2) python scripts/download_models.py  → BGE-M3 + Qwen3-Reranker 로컬 다운로드
+#   3) docker compose up -d
+#
+# GPU EC2 (g4dn/p3) 배포:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# 환경변수 파일: .env.example 참고
+# ─────────────────────────────────────────────────────────────────────────────
+
+networks:
+  backend_net:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redis_data:
+  model_cache:      # BGE-M3 + Qwen3-Reranker HF 캐시 — scripts/download_models.py 로 사전 다운로드
+
+services:
+  # ── 1. RAG 지식 저장소 DB (pgvector) ────────────────────────────────────────
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: db_container
+    restart: unless-stopped
+    networks: [backend_net]
+    # EC2: 외부 노출 불필요 — backend_net 내부에서만 접근. 로컬 개발 시 아래 주석 해제.
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_USER:     ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB:       ${DB_NAME}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ── 2. Redis 캐시 (도면 JSON 임시 저장) ─────────────────────────────────────
+  redis_cache:
+    image: redis:7-alpine
+    container_name: redis_container
+    restart: unless-stopped
+    networks: [backend_net]
+    # EC2: 외부 노출 안 함
+    # ports:
+    #   - "127.0.0.1:6379:6379"
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --save ""
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ── 3. 백엔드 FastAPI ────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile   # GPU: docker-compose.gpu.yml 참고
+    container_name: backend_container
+    restart: unless-stopped
+    networks: [backend_net]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis_cache:
+        condition: service_healthy
+    ports:
+      - "8000:8000"        # EC2 보안그룹에서 8000 허용 또는 nginx 역방향 프록시 뒤에 배치
+    environment:
+      # DB
+      DB_HOST:     db
+      DB_PORT:     "5432"
+      DB_NAME:     ${DB_NAME}
+      DB_USER:     ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      # Redis
+      REDIS_HOST:  redis_cache
+      REDIS_URL:   redis://redis_cache:6379/0
+      # AI 모델 캐시 (볼륨 마운트와 일치)
+      # 최초 기동 시 모델 자동 다운로드 → 이후 캐시 사용
+      HF_HOME:              /app/models
+      # AWS S3
+      AWS_ACCESS_KEY_ID:     ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_S3_BUCKET_NAME:    ${AWS_S3_BUCKET_NAME:-}
+      AWS_REGION:            ${AWS_REGION:-ap-northeast-2}
+      # OpenAI
+      OPENAI_API_KEY:        ${OPENAI_API_KEY:-}
+    volumes:
+      # 호스트의 ./models 디렉터리를 컨테이너 /app/models 에 마운트
+      # 최초 기동 시 model_check.py가 자동 다운로드 (쓰기 필요)
+      - type: bind
+        source: ${MODEL_DIR:-./models}
+        target: /app/models
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')\" 2>/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s    # 모델 로딩 시간 고려
+
+  # ── 4. 프론트엔드 (React/Vite) ──────────────────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: frontend_container
+    restart: unless-stopped
+    networks: [backend_net]
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_BASE_URL: "http://15.164.110.240:8000"

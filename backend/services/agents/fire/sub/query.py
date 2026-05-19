@@ -9,21 +9,79 @@ Modification History:
     - 2026-04-18 (김지우) : llm_service 연동으로 리팩터링
     - 2026-04-19 (김민정) : 누락된 임포트 추가 및 하이브리드 RAG 런타임 오류 수정
     - 2026-04-23       : piping 방식과 동일하게 통일 (AsyncSession, vector_service 기반)
+    - 2026-05-04       : QueryRagEngine 도입 — 멀티쿼리·domain 확장·reranker 적용
 """
 
 import json
 import logging
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from backend.services import vector_service
 from backend.services.llm_service import generate_answer
+from backend.services.agents.fire.rag_engine import FireRagEngine
 
 
 class QueryAgent:
-    def __init__(self, db: AsyncSession):
-        self.db = db
+    FIRE_DOMAINS = ("fire", "소방")
+    FINAL_LIMIT = 8
 
-    FIRE_DOMAINS = ("fire",)
+    def __init__(self, db: AsyncSession):
+        self.db  = db
+        self._rag = FireRagEngine(db)
+
+    @staticmethod
+    def _normalize_limit(limit, default: int = FINAL_LIMIT) -> int:
+        try:
+            value = int(limit)
+            return max(1, min(value, 50))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _fire_extra_queries(query: str) -> list[str]:
+        q = (query or "").lower()
+        extra: list[str] = []
+
+        def add_if(triggers: tuple[str, ...], anchors: list[str]) -> None:
+            if any(t.lower() in q for t in triggers):
+                extra.extend(anchors)
+
+        add_if(
+            ("스프링클러", "sprinkler", "헤드", "살수", "방수구역", "간격"),
+            ["스프링클러 헤드 설치 간격 살수반경 NFSC", "스프링클러 설비 배관 헤드 수량 배치 기준"],
+        )
+        add_if(
+            ("감지기", "detector", "화재감지", "연기", "열감지"),
+            ["감지기 설치 높이 감지 면적 설치 간격 NFSC", "자동화재탐지설비 감지기 기준"],
+        )
+        add_if(
+            ("소화전", "hydrant", "옥내소화전", "방수압", "방수량"),
+            ["옥내소화전 설치 기준 방수압력 방수량 이격거리 NFSC"],
+        )
+        add_if(
+            ("소화기", "extinguisher", "보행거리", "능력단위"),
+            ["소화기 설치 기준 보행거리 능력단위 소방시설법"],
+        )
+        add_if(
+            ("펌프", "pump", "가압송수", "토출", "양정"),
+            ["소방펌프 토출압력 양정 유량 기준 NFSC"],
+        )
+        add_if(
+            ("배관", "밸브", "플랜지", "관경", "구경", "압력배관"),
+            ["소방 배관 재질 구경 밸브 플랜지 KS KCS NFSC"],
+        )
+        add_if(
+            ("방화문", "방화구획", "내화", "제연", "연기"),
+            ["방화문 방화구획 제연설비 소방시설법 건축법 NFSC"],
+        )
+
+        extra.extend(["NFSC", "소방시설법 시행령 시행규칙", "화재안전기술기준 KCS KS"])
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for item in extra:
+            if item and item not in seen:
+                seen.add(item)
+                deduped.append(item)
+        return deduped[:6]
 
     async def execute(
         self,
@@ -33,74 +91,45 @@ class QueryAgent:
         domain: str = "fire",
         limit: int = 5,
         permanent_category: str | None = None,
+        target_doc: str | None = None,
+        strict_target_doc: bool = False,
+        **kwargs,
     ) -> list[dict]:
         """
-        소방 법규(NFSC) 시방서를 하이브리드 RAG(Dense + Sparse RRF)로 검색합니다.
+        소방 법규(NFSC) / 시방서를 FireRagEngine으로 검색합니다.
 
-        - 항상 영구 시방서(국가 표준/관리자 업로드)를 먼저 검색
-        - spec_guid + org_id 제공 시: 임시 시방서(사용자 업로드)를 추가 검색하여 뒤에 병합
+        공개 API는 기존과 동일. 내부에서 멀티쿼리·domain 확장·reranker를 적용합니다.
+        결과가 없으면 빈 리스트를 반환하며, 상위 레이어에서 안내 메시지를 출력합니다.
         """
-        results: list[dict] = []
+        query = (query or "").strip()
+        if not query:
+            logging.warning("[FireQueryAgent] 빈 query 입력")
+            return []
 
-        # 1. 영구 시방서 검색
-        search_domains = self.FIRE_DOMAINS if domain in ("fire",) else (domain,)
-        perm_chunks_all = []
-        for d in search_domains:
-            chunks = await vector_service.hybrid_search_permanent_chunks(
-                self.db,
-                query,
-                document_id=None,
-                domain=d,
-                category=permanent_category,
-                limit=limit,
-            )
-            perm_chunks_all.extend(chunks)
+        limit = self._normalize_limit(limit)
+        logging.info(
+            "[FireQueryAgent] query=%r domain=%s limit=%s target_doc=%r strict=%s category=%r ignored_kwargs=%s",
+            query[:120],
+            domain,
+            limit,
+            target_doc,
+            strict_target_doc,
+            permanent_category,
+            sorted(kwargs.keys()) if kwargs else [],
+        )
 
-        # 중복 제거 후 limit 적용
-        seen = set()
-        perm_chunks = []
-        for c in perm_chunks_all:
-            key = (c.document_id, c.chunk_index)
-            if key not in seen:
-                seen.add(key)
-                perm_chunks.append(c)
-        perm_chunks = perm_chunks[:limit]
-
-        for chunk in perm_chunks:
-            results.append({
-                "source": "permanent",
-                "id": chunk.id,
-                "document_id": chunk.document_id,
-                "chunk_index": chunk.chunk_index,
-                "content": chunk.content,
-                "domain": chunk.domain,
-                "category": chunk.category,
-                "doc_name": chunk.doc_name,
-                "section_id": chunk.section_id,
-            })
-
-        # 2. 임시 시방서 검색 (사용자 업로드 시방서가 있을 경우)
-        if spec_guid and org_id:
-            temp_chunks = await vector_service.hybrid_search_temp_chunks(
-                self.db,
-                query,
-                spec_guid=spec_guid,
-                org_id=org_id,
-                limit=limit,
-            )
-            for chunk in temp_chunks:
-                results.append({
-                    "source": "temp",
-                    "document_id": chunk.temp_document_id,
-                    "chunk_index": chunk.chunk_index,
-                    "content": chunk.content,
-                    "domain": chunk.domain,
-                    "category": chunk.category,
-                    "doc_name": chunk.doc_name,
-                    "section_id": chunk.section_id,
-                })
-
-        return results
+        return await self._rag.retrieve(
+            main_query         = query,
+            spec_guid          = spec_guid,
+            org_id             = org_id,
+            domain             = domain,
+            extra_queries      = self._fire_extra_queries(query),
+            final_limit        = max(limit, self.FINAL_LIMIT),
+            include_default_queries = False,
+            permanent_category = permanent_category,
+            target_doc         = target_doc,
+            strict_target_doc  = strict_target_doc,
+        )
 
     async def resolve_terms(self, terms: list) -> dict:
         """

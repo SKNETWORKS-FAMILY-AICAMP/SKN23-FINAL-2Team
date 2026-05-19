@@ -210,7 +210,13 @@ class ArchWorkflowHandler(BaseWorkflowHandler):
             )
             return {
                 "agent": "review",
-                "result": {"report": report, "fixes": fixes, "rag_references": rag_results},
+                "result": {
+                    "report": report,
+                    "fixes": fixes,
+                    "rag_references": rag_results,
+                    # KPI(recall_lower_bound) 자리 — arch deterministic_checker 도입 시 채움.
+                    "deterministic_violations": [],
+                },
             }
 
         # ── call_action_agent ─────────────────────────────────────────────────

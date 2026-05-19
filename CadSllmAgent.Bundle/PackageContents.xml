@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  File    : CadSllmAgent.Bundle/PackageContents.xml
+  Create  : 2026-04-28
+  Description : AutoCAD ApplicationPlugins 표준 패키지 매니페스트.
+                이 파일이 CadSllmAgent.bundle/ 폴더 루트에 위치해야
+                AutoCAD가 플러그인을 자동 인식하여 로드합니다.
+                
+  배포 위치: %APPDATA%\Autodesk\ApplicationPlugins\CadSllmAgent.bundle\PackageContents.xml
+-->
+<ApplicationPackage
+    SchemaVersion="1.0"
+    AppVersion="1.0.0"
+    ProductCode="{E3FAF42F-796B-4C81-9D03-C93ECE8EDD19}"
+    Name="CadSllmAgent"
+    Description="AI-powered CAD Review Agent — 도면 규정 위반 자동 검토"
+    Author="SKN23-2TEAM">
+    
+  <CompanyDetails
+      Name="SKN23-2TEAM"
+      Url="https://github.com/JUYEOP024/SKN23-FINAL-2TEAM"
+      Email="admin@skn23.local" />
+  
+  <Components>
+    <RuntimeRequirements
+        OS="Win64"
+        Platform="AutoCAD"
+        SeriesMin="R24.0"
+        SeriesMax="R27.0" />
+    <ComponentEntry
+        AppName="CadSllmAgent"
+        Version="1.0.0"
+        ModuleName="./Contents/CadSllmAgent.dll"
+        AppType=".Net"
+        LoadOnAutoCADStartup="True" />
+  </Components>
+</ApplicationPackage>

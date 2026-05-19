@@ -36,7 +36,7 @@ async def agent_node(state: ElectricAgentState) -> dict:
     ))
     
     # LLM 호출
-    response = await llm_with_tools.ainvoke([sys_msg] + state.messages)
+    response = await llm_with_tools.ainvoke([sys_msg] + state.get("messages", []))
     
     # 생성된 메시지를 기존 메시지 배열에 추가 (Annotated[operator.add]에 의해 누적됨)
     return {"messages": [response]}

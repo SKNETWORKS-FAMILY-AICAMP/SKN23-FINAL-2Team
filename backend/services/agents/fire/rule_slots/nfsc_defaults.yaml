@@ -1,0 +1,47 @@
+- rule_id: NFSC-103-spacing-sprinkler
+  rule_topic: 스프링클러 헤드 간격
+  equipment_category: sprinkler
+  candidate_type: spacing
+  measure_type: distance
+  unit: mm
+  comparator: lte
+  threshold: 2300
+  condition_text: ""
+  source_type: nfsc
+  priority: 10
+
+- rule_id: NFSC-203-spacing-detector
+  rule_topic: 감지기 수평거리
+  equipment_category: detector
+  candidate_type: spacing
+  measure_type: distance
+  unit: mm
+  comparator: lte
+  threshold: 4500
+  condition_text: ""
+  source_type: nfsc
+  priority: 10
+
+- rule_id: NFSC-extinguisher-walking
+  rule_topic: 소화기 보행거리
+  equipment_category: extinguisher
+  candidate_type: coverage
+  measure_type: distance
+  unit: mm
+  comparator: lte
+  threshold: 20000
+  condition_text: ""
+  source_type: nfsc
+  priority: 10
+
+- rule_id: NFSC-hydrant-spacing
+  rule_topic: 옥내소화전 이격거리
+  equipment_category: hydrant
+  candidate_type: spacing
+  measure_type: distance
+  unit: mm
+  comparator: lte
+  threshold: 25000
+  condition_text: ""
+  source_type: nfsc
+  priority: 10

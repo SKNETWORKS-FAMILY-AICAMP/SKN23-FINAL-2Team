@@ -1,23 +1,9 @@
 """
 File    : backend/services/agents/elec/sub/elec_attr_extractor.py
-Author  : AI Assistant
-Create  : 2026-04-28
 Description :
-  매핑된 텍스트 라벨에서 전기 속성(전압, 위상, 주파수, 전선 굵기, 전류 등)을
-  정규식으로 추출하여 해당 블록 엔티티에 주입하는 유틸리티.
-
-  도면의 블록에 ATTDEF(속성 정의)가 없고, 전기 정보가 근처 TEXT로만 표기된
-  경우에 사용된다. 텍스트→블록 매핑(object_mapping)이 선행되어야 함.
-
-  지원 추출 패턴:
-    - 전압 : "380V", "220V", "AC110V", "DC24V" → voltage_v
-    - 위상 : "3∅", "3Φ", "1∅", "단상", "3상"  → phase
-    - 주파수: "60HZ", "50Hz"                     → frequency_hz
-    - 전선  : "2.5SQ", "10SQ", "16SQ"            → cable_sqmm
-    - 전류  : "20A", "100A"                       → current_a
-    - 접지  : "GND", "GROUND", "접지"             → is_ground
-    - 동력  : "MOTOR", "모터", "모타"              → is_motor
+  텍스트 기반 전기 속성 추출 + 전기 설비 분류
 """
+
 from __future__ import annotations
 
 import logging
@@ -26,98 +12,79 @@ from typing import Any
 
 _log = logging.getLogger(__name__)
 
-# ── 정규식 패턴 (컴파일) ──────────────────────────────────────────────────────
+# ── 정규식 패턴 ─────────────────────────────────────────
 
-# 전압: "380V", "AC220V", "DC24V", "110~220V"
-_VOLTAGE_RE = re.compile(
-    r"(?:AC|DC)?\s*(\d{2,4})\s*V(?!\w)",
+_VOLTAGE_RE = re.compile(r"(?:AC|DC)?\s*(\d{2,4})\s*V", re.IGNORECASE)
+_PHASE_RE   = re.compile(r"(\d)\s*[∅Φφ상]|단상", re.IGNORECASE)
+_FREQ_RE    = re.compile(r"(\d{2})\s*HZ", re.IGNORECASE)
+_SQ_RE      = re.compile(r"(\d+(?:\.\d+)?)\s*SQ", re.IGNORECASE)
+_WIRE_SIZE_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?:mm\s*(?:2|²)?|㎟|SQ)",
     re.IGNORECASE,
 )
-
-# 위상: "3∅", "3Φ", "3φ", "3상", "단상", "1∅"
-_PHASE_RE = re.compile(
-    r"(\d)\s*[∅Φφ상]|단상",
-    re.IGNORECASE,
+_POLE_RE = re.compile(r"\b(\d+)\s*P\b", re.IGNORECASE)
+_BOLT_RE = re.compile(r"\bM\s*(\d+(?:\.\d+)?)\b", re.IGNORECASE)
+_AMP_RE     = re.compile(r"(?<!V)(\d+(?:\.\d+)?)\s*A", re.IGNORECASE)
+_LABEL_KEY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("suitable_wire", re.compile(r"\uc801\ud569\s*\uc804\uc120")),
+    ("standard_product", re.compile(r"\ud45c\uc900\s*\ud488")),
 )
 
-# 주파수: "60HZ", "50Hz"
-_FREQ_RE = re.compile(
-    r"(\d{2})\s*HZ",
-    re.IGNORECASE,
-)
+_GND_RE     = re.compile(r"\bGND\b|\bGROUND\b|\bEARTH\b|접지", re.IGNORECASE)
+_MOTOR_RE   = re.compile(r"\bMOTOR\b|모터|모타", re.IGNORECASE)
+_BREAKER_RE = re.compile(r"\bMCCB\b|\bMCB\b|\bELB\b|\bACB\b|차단기", re.IGNORECASE)
 
-# 전선 굵기: "2.5SQ", "10SQ", "16sq"
-_SQ_RE = re.compile(
-    r"(\d+(?:\.\d+)?)\s*SQ",
-    re.IGNORECASE,
-)
 
-# 전류: "20A", "100A"  (V 바로 뒤의 A는 VA 단위이므로 제외)
-_AMP_RE = re.compile(
-    r"(?<!V)(?<!\d)(\d+(?:\.\d+)?)\s*A(?!\w)",
-    re.IGNORECASE,
-)
-
-# 접지 키워드
-_GND_RE = re.compile(
-    r"\bGND\b|\bGROUND\b|\bEARTH\b|접지",
-    re.IGNORECASE,
-)
-
-# 모터 키워드
-_MOTOR_RE = re.compile(
-    r"\bMOTOR\b|모터|모타",
-    re.IGNORECASE,
-)
-
-# 차단기 키워드
-_BREAKER_RE = re.compile(
-    r"\bMCCB\b|\bMCB\b|\bELB\b|\bNFB\b|\bACB\b|차단기",
-    re.IGNORECASE,
-)
-
+# ── 1. 텍스트 → 전기 속성 추출 ─────────────────────────
 
 def extract_elec_attrs(text: str) -> dict[str, Any]:
-    """
-    텍스트 문자열에서 전기 속성을 정규식으로 추출한다.
-
-    Returns:
-        추출된 속성 딕셔너리. 해당 패턴이 없으면 키 자체가 없음.
-        예: {"voltage_v": 380, "phase": 3, "frequency_hz": 60}
-    """
     attrs: dict[str, Any] = {}
 
-    # 전압 (여러 전압이 있을 수 있음: "380V/440V" → 첫 번째 사용)
     vm = _VOLTAGE_RE.findall(text)
     if vm:
         attrs["voltage_v"] = int(vm[0])
-        if len(vm) > 1:
-            attrs["voltage_alt_v"] = int(vm[1])
 
-    # 위상
     pm = _PHASE_RE.search(text)
     if pm:
         if "단상" in text:
             attrs["phase"] = 1
-        elif pm.group(1):
+        else:
             attrs["phase"] = int(pm.group(1))
 
-    # 주파수
     fm = _FREQ_RE.search(text)
     if fm:
         attrs["frequency_hz"] = int(fm.group(1))
 
-    # 전선 굵기
-    sm = _SQ_RE.findall(text)
-    if sm:
-        attrs["cable_sqmm"] = float(sm[0])
+    wire_matches = _WIRE_SIZE_RE.findall(text)
+    if wire_matches:
+        wire_size = _normalize_wire_size(wire_matches[0])
+        attrs["wire_size"] = wire_size
+        attrs["cable_sqmm"] = float(wire_matches[0])
+    else:
+        sm = _SQ_RE.findall(text)
+        if sm:
+            attrs["cable_sqmm"] = float(sm[0])
 
-    # 전류
+    pole_options = _unique_keep_order(f"{p.upper()}P" for p in _POLE_RE.findall(text))
+    if pole_options:
+        attrs["pole_options"] = pole_options
+
+    bm = _BOLT_RE.search(text)
+    if bm:
+        attrs["bolt_size"] = f"M{_normalize_number_text(bm.group(1))}"
+
+    label_keys = [
+        key
+        for key, pattern in _LABEL_KEY_PATTERNS
+        if pattern.search(text)
+    ]
+    if label_keys:
+        attrs["label_keys"] = label_keys
+
     am = _AMP_RE.findall(text)
     if am:
         attrs["current_a"] = float(am[0])
 
-    # 설비 타입 플래그
     if _GND_RE.search(text):
         attrs["equip_type"] = "ground"
     elif _MOTOR_RE.search(text):
@@ -128,53 +95,130 @@ def extract_elec_attrs(text: str) -> dict[str, Any]:
     return attrs
 
 
-def inject_elec_attrs_from_mapping(
+# ── 2. BLOCK/레이어 기반 설비 분류 ───────────────────────
+
+def _normalize_wire_size(raw_size: str) -> str:
+    return f"{_normalize_number_text(raw_size)}mm2"
+
+
+def _normalize_number_text(raw_number: str) -> str:
+    number = float(raw_number)
+    return str(int(number)) if number.is_integer() else str(number)
+
+
+def _unique_keep_order(values) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
+def _merge_attr(target: dict[str, Any], key: str, value: Any) -> None:
+    if key in {"pole_options", "label_keys"}:
+        existing = target.get(key) or []
+        target[key] = _unique_keep_order([*existing, *value])
+    elif key not in target:
+        target[key] = value
+
+
+def classify_elec_entity(el: dict) -> dict[str, Any]:
+    name = " ".join([
+        str(el.get("effective_name") or ""),
+        str(el.get("block_name") or ""),
+        str(el.get("layer") or ""),
+        str(el.get("type") or ""),
+    ]).upper()
+
+    result: dict[str, Any] = {}
+
+    if "EXIT" in name and "LIGHT" in name:
+        result["category"] = "LIGHT"
+        result["subtype"] = "EXIT_LIGHT"
+
+    elif "LIGHT" in name or "LAMP" in name:
+        result["category"] = "LIGHT"
+
+    elif "SWITCH" in name or re.search(r"\bSW\b", name):
+        result["category"] = "SWITCH"
+
+    elif "SOCKET" in name or "OUTLET" in name:
+        result["category"] = "SOCKET"
+
+    elif "PNL" in name or "PANEL" in name:
+        result["category"] = "PANEL"
+
+    elif any(k in name for k in ["MCCB", "MCB", "ELB", "ACB", "BREAKER"]):
+        result["category"] = "BREAKER"
+
+    elif "CABLE" in name or "WIRE" in name or "SQ" in name:
+        result["category"] = "CABLE"
+
+    if result:
+        result["domain"] = "ELEC"
+
+    return result
+
+
+# ── 3. 속성 주입 + 분류 주입 ───────────────────────────
+
+def inject_elec_data(
     elements: list[dict],
     object_mapping: list[dict],
 ) -> dict[str, dict]:
     """
-    object_mapping의 label 텍스트에서 전기 속성을 추출하여
-    해당 block_handle의 element에 주입한다.
-
-    Args:
-        elements: parsed["elements"] — 파싱된 엔티티 리스트 (in-place 수정)
-        object_mapping: 텍스트→블록 매핑 리스트
-
-    Returns:
-        block_handle → 추출된 속성 딕셔너리 (디버그/로깅용)
+    1. 텍스트 → 전기 속성 추출
+    2. BLOCK → 전기 설비 분류
     """
-    # 1. block_handle별 모든 라벨 수집
+
+    # ── 텍스트 → 블록 매핑 기반 속성 수집 ─────────────
     handle_labels: dict[str, list[str]] = {}
+
     for m in object_mapping:
         bh = str(m.get("block_handle", ""))
         label = str(m.get("label", "")).strip()
         if bh and label:
             handle_labels.setdefault(bh, []).append(label)
 
-    # 2. 각 블록의 라벨들에서 전기 속성 추출
     handle_attrs: dict[str, dict] = {}
+
     for bh, labels in handle_labels.items():
         merged: dict[str, Any] = {}
+
         for label in labels:
             extracted = extract_elec_attrs(label)
             for k, v in extracted.items():
-                if k not in merged:  # 첫 번째 추출값 우선
-                    merged[k] = v
+                _merge_attr(merged, k, v)
+
         if merged:
             handle_attrs[bh] = merged
 
-    # 3. elements에 주입
+    # ── element에 주입 ─────────────────────────────
     injected_count = 0
+    classified_count = 0
+
     for el in elements:
-        el_handle = str(el.get("handle") or el.get("id") or "")
-        attrs = handle_attrs.get(el_handle)
+        handle = str(el.get("handle") or el.get("id") or "")
+
+        # 1. 속성 주입
+        attrs = handle_attrs.get(handle)
         if attrs:
             el.setdefault("elec_attrs", {}).update(attrs)
             injected_count += 1
 
+        # 2. 설비 분류
+        classified = classify_elec_entity(el)
+        if classified:
+            el.setdefault("elec_attrs", {}).update(classified)
+            el.update(classified)
+            classified_count += 1
+
     _log.info(
-        "[ElecAttrExtractor] %d개 블록에서 전기 속성 추출, %d개 element에 주입 완료",
-        len(handle_attrs), injected_count,
+        "[ElecAttrExtractor] 속성주입=%d, 분류=%d",
+        injected_count,
+        classified_count,
     )
 
     return handle_attrs

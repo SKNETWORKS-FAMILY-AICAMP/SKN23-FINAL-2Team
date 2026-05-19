@@ -12,8 +12,8 @@ Modification History :
 import json
 import time
 import uuid
-from evaluation.kpi_scorer import CADAgentScorer
-from evaluation.schemas import Violation, RetrievedChunk, MarkupResult
+from backend.services.evaluation.kpi_score import CADAgentScorer
+from backend.services.evaluation.schemas import Violation, RetrievedChunk, MarkupResult
 
 # 1. 공식 스코어러 준비
 # 이 객체가 내부적으로 Langfuse와 연결되어 점수를 보냅니다.
@@ -93,7 +93,7 @@ print(f"[EVAL-03] 공식 평가 완료 (Trace ID: {trace_id})")
 print("============================")
 print(f"Hit@K (조항 적중률) : {eval_result.chunk_hit_rate * 100:.1f}%")
 print(f"F1 Score (위반 탐지) : {eval_result.f1_score:.4f}")
-print(f"평균 검색 유사도      : {eval_result.embedding_similarity_avg:.4f}")
+print(f"RAG 활용률           : {eval_result.rag_retrieval_relevance:.4f}")
 print(f"총 응답 시간         : {eval_result.response_time_sec:.2f}s")
 print("============================")
 print("Langfuse 대시보드에 기록되었습니다.")

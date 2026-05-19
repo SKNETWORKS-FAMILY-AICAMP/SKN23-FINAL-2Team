@@ -1,9 +1,21 @@
 """
 CAD Agent — KPI 스코어링 모듈
-15개 커스텀 KPI를 계산하고 Langfuse에 기록.
+
+대시보드 스펙(2026-05-09 기준)을 따른다:
+  ① 핵심 성능/정확도 (15개): f1_score, citation_accuracy, false_negative_rate,
+     false_positive_rate, coord_error_mm, parsing_success_rate, chunk_hit_rate,
+     rag_retrieval_relevance, markup_completeness, response_time_sec,
+     sllm_latency_ms, agent_error_rate, review_consistency, cost_per_review,
+     model_name
+  ② 운영 안정성/실무 효용성 (4개): e2e_success_rate, escalation_rate,
+     valid_escalation_rate, markup_position_acceptance_rate
+  ③ Archived: embedding_similarity_avg, violation_count
+
+review_consistency / valid_escalation_rate / cost_per_review 는 입력 신호가
+있을 때만 emit (값 0 으로 dashboard 노이즈를 만들지 않기 위함).
 
 사용법:
-    from backend.services.evaluation.kpi_scorer import CADAgentScorer
+    from backend.services.evaluation.kpi_score import CADAgentScorer
 
     scorer = CADAgentScorer()
     result = scorer.evaluate(trace_id="xxx", domain="fire", ...)
@@ -225,6 +237,12 @@ class CADAgentScorer:
         accepted_count: int = 0,
         total_markings: int = 0,
         model_name: str = "",
+        # 일관성 — 동일 도면 다중 실행 시에만 의미. 단일 실행에서는 None/빈 값으로 두면 emit 생략.
+        multiple_run_violations: list[set[str]] | None = None,
+        # 실시간 정확도 추정 — 신호 있을 때만 emit
+        precision_judge: float | None = None,        # LLM-as-Judge 결과 비율 (0~1)
+        deterministic_violation_ids: set[str] | None = None,  # |deterministic|
+        prediction_ids_for_recall: set[str] | None = None,    # LLM 위반 id 집합
     ) -> EvalResult:
 
         # 계산
@@ -248,6 +266,23 @@ class CADAgentScorer:
         v_esc_rate = self.calc_valid_escalation_rate(escalation_triggered, is_valid_escalation)
         pos_acc_rate = self.calc_markup_position_acceptance_rate(accepted_count, total_markings)
 
+        # 일관성: 다중 실행 입력이 있을 때만 계산
+        consistency: float | None = None
+        if multiple_run_violations and len(multiple_run_violations) >= 2:
+            consistency = self.calc_review_consistency(multiple_run_violations)
+
+        # 실시간 정확도 추정 (정답셋 없이) — deterministic 커버리지 + LLM-judge precision
+        recall_lb: float | None = None
+        if deterministic_violation_ids:
+            preds = prediction_ids_for_recall or set()
+            covered = len(deterministic_violation_ids & preds)
+            recall_lb = covered / len(deterministic_violation_ids)
+
+        f1_est: float | None = None
+        if precision_judge is not None and recall_lb is not None:
+            denom = precision_judge + recall_lb
+            f1_est = (2 * precision_judge * recall_lb / denom) if denom > 0 else 0.0
+
         # Langfuse 기록
         trace = self.langfuse.trace(id=trace_id)
 
@@ -269,18 +304,31 @@ class CADAgentScorer:
             "parsing_success_rate": round(parse_rate, 4),
         }
 
-        # 정당한 에스컬레이션 비율은 발생 시에만 기록
+        # 입력 신호가 있을 때만 추가 — 단일 호출 dashboard 노이즈 방지
         if v_esc_rate is not None:
             scores["valid_escalation_rate"] = v_esc_rate
+        if consistency is not None:
+            scores["review_consistency"] = round(consistency, 4)
+        if cost > 0:
+            scores["cost_per_review"] = round(cost, 4)
+        if precision_judge is not None:
+            scores["precision_judge"] = round(precision_judge, 4)
+        if recall_lb is not None:
+            scores["recall_lower_bound"] = round(recall_lb, 4)
+        if f1_est is not None:
+            scores["f1_estimate"] = round(f1_est, 4)
 
         for name, value in scores.items():
             trace.score(name=name, value=value)
 
+        # Langfuse score 는 float 만 허용 → 모델명·도메인은 trace metadata 로 기록.
+        meta: dict[str, str] = {}
         if model_name:
-            # Langfuse score는 float만 허용 → 모델명은 trace metadata에 기록
-            trace.update(metadata={"model_name": model_name})
-        if cost > 0:
-            trace.score(name="cost_per_review", value=round(cost, 4))
+            meta["model_name"] = model_name
+        if domain:
+            meta["domain"] = domain
+        if meta:
+            trace.update(metadata=meta)
 
         self.langfuse.flush()
 
@@ -289,11 +337,15 @@ class CADAgentScorer:
             citation_accuracy=citation_acc, coord_error_mm=coord_err,
             false_positive_rate=fpr, false_negative_rate=fnr,
             rag_retrieval_relevance=rag_rel, chunk_hit_rate=hit_rate,
-            markup_completeness=markup_comp, 
+            markup_completeness=markup_comp,
             markup_position_acceptance_rate=pos_acc_rate,
             e2e_success_rate=e2e_success,
             escalation_rate=esc_rate, valid_escalation_rate=v_esc_rate or 0.0,
             response_time_sec=resp_time, sllm_latency_ms=sllm_lat,
             agent_error_rate=err_rate, parsing_success_rate=parse_rate,
+            review_consistency=consistency or 0.0,
             model_name=model_name, cost_per_review=cost,
+            precision_judge=precision_judge or 0.0,
+            recall_lower_bound=recall_lb or 0.0,
+            f1_estimate=f1_est or 0.0,
         )

@@ -29,7 +29,7 @@ _NCS_MEP_PREFIX_RE = re.compile(r"^(M-|P-)", re.IGNORECASE)
 # 배관·기계/위생 추정 키워드
 _MEP_HINT_RE = re.compile(
     r"(GAS|PIPE|PIPING|MEP|HVAC|SPRINK|CWS|HWS|CWR|HWR|"
-    r"DRAIN|VAV|TEX$|DUAL|CHW|HOT|COLD|FW|RISER|VALVE|MANHOLE|DUCT|PUMP|"
+    r"DRAIN|VAV|DUAL|CHW|HOT|COLD|FW|RISER|VALVE|MANHOLE|DUCT|PUMP|"
     r"PFW|HFG|FIRE|FM-|FP-|ELEC-F|"
     r"가스|배관|급수|배수|소화|위생|기계|냉난방|덕트|펌프|밸브|배기|급기|환기)",
     re.IGNORECASE,
@@ -64,9 +64,24 @@ _TITLE_TEXT_RE = re.compile(
     r"평면도|계통도|단면도|전개도|SCALE|DATE|도면번호|DWG\s*NO|PROJECT|도면명|축척",
     re.IGNORECASE,
 )
+_TITLE_TEXT_FALLBACK_RE = re.compile(
+    r"평면도|도면명|도면번호|축척|SCALE|DRAWING|DWG\s*NO|PROJECT|DATE|A1\s*:|A3\s*:",
+    re.IGNORECASE,
+)
 _PIPE_ANNOTATION_TEXT_RE = re.compile(
-    r"가스|GAS|LPG|LNG|배관|누설|경보기|차단기|콕|후크콕|레듀샤|밸브|VALVE|"
+    r"가스|GAS|LPG|LNG|배관|누설|경보기|차단기|콕|후크콕|휴즈콕|퓨즈콕|"
+    r"레듀샤|레듀셔|리듀서|REDUCER|밸브|VALVE|"
     r"\bDN\s*\d+(?:\.\d+)?\b|\b\d+(?:\.\d+)?\s*A\b|\bG\b",
+    re.IGNORECASE,
+)
+_PIPE_DRAWING_CONTEXT_RE = re.compile(
+    r"가스|배관|급수|급탕|배수|오수|위생|수전|육가|"
+    r"GAS|PIPE|PIPING|DRAIN|SANIT|WATER|CWS|HWS",
+    re.IGNORECASE,
+)
+_PIPE_SIZE_TEXT_RE = re.compile(r"^\s*\d{2,3}(?:\s+\d{2,3}){0,2}\s*$")
+_SANITARY_SYMBOL_TEXT_RE = re.compile(
+    r"^\s*(?:D|S|V|SD|FD|VP|CW|HW|CWS|HWS)\s*$",
     re.IGNORECASE,
 )
 _ROOM_LABEL_TEXT_RE = re.compile(
@@ -76,6 +91,8 @@ _ROOM_LABEL_TEXT_RE = re.compile(
 )
 _TITLE_GRAPHIC_NEAR_TOL = 120.0
 _PIPE_ANNOTATION_GRAPHIC_NEAR_TOL = 260.0
+_PIPE_ANNOTATION_BLOCK_MAX_DIM = 5000.0
+_GENERIC_LAYER_NAME_RE = re.compile(r"^(?:0|L\d+|LAYER\d*|\d+)$", re.IGNORECASE)
 
 
 def classify_layer_role(
@@ -97,10 +114,6 @@ def classify_layer_role(
         db_role = db_role_map.get(n) or db_role_map.get(n.upper())
         if db_role in _VALID_ROLES:
             return db_role  # type: ignore[return-value]
-
-    # 1.4. TEX 레이어는 배관 주석의 핵심이므로 mep로 확정
-    if n.upper() == "TEX":
-        return "mep"
 
     # 1.5. 표제란/도면 정보 레이어는 건축이 아니라 검토 제외 메타(aux)입니다.
     if bool(_TITLE_HINT_RE.search(n)):
@@ -132,9 +145,9 @@ def _is_grey_color(color: str) -> bool:
     return color in _ARCH_ACI_COLORS
 
 
-def _score_entity_for_mep_in_l_layer(entity: dict) -> tuple[float, str]:
+def _score_entity_for_mep_context(entity: dict) -> tuple[float, str]:
     """
-    L-layer 내 엔티티의 MEP 특성 스코어 계산.
+    엔티티 자체의 MEP 특성 스코어 계산.
 
     반환: (mep_score: 0-1, indicator_reason: str)
     - 0.8+: 블록명/텍스트에 MEP 키워드
@@ -161,8 +174,14 @@ def _score_entity_for_mep_in_l_layer(entity: dict) -> tuple[float, str]:
 
     # 3. 색상은 사용자/프로젝트별 표준 차이가 커서 단독 승격 근거로 쓰지 않는다.
     #    아래 점수는 debug/보조 힌트일 뿐, review 승격 조건으로 사용하지 않는다.
-    color = str(entity.get("color") or "")
-    if color and not _is_grey_color(color) and color not in ("7", ""):  # 7=흰색/검은색
+    color = str(entity.get("color") or "").strip()
+    color_key = color.upper()
+    if (
+        color
+        and color_key not in {"BYLAYER", "BYBLOCK", "NONE"}
+        and not _is_grey_color(color)
+        and color != "7"
+    ):  # 7=흰색/검은색
         return 0.1, f"vivid_color_weak_hint:{color}"
 
     return 0.0, ""
@@ -187,18 +206,54 @@ def _entity_text(e: dict) -> str:
     return str(e.get("text") or e.get("content") or "").strip()
 
 
+def _drawing_has_pipe_context(drawing_data: dict | None, entities: list[dict]) -> bool:
+    haystacks: list[str] = []
+    if isinstance(drawing_data, dict):
+        haystacks.extend(
+            str(drawing_data.get(k) or "")
+            for k in ("drawing_title", "title", "name", "domain_hint")
+        )
+    for e in entities:
+        if not isinstance(e, dict):
+            continue
+        t = str(e.get("raw_type") or e.get("type") or "").upper()
+        if t in ("TEXT", "MTEXT", "MLEADER", "LEADER"):
+            txt = _entity_text(e)
+            if txt:
+                haystacks.append(txt)
+    return bool(_PIPE_DRAWING_CONTEXT_RE.search(" ".join(haystacks)))
+
+
+def _is_pipe_size_annotation_text(text: str) -> bool:
+    if not _PIPE_SIZE_TEXT_RE.match(text or ""):
+        return False
+    try:
+        values = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", text)]
+    except ValueError:
+        return False
+    return bool(values) and all(10.0 <= v <= 300.0 for v in values)
+
+
 def _is_title_text_entity(e: dict) -> bool:
     t = str(e.get("raw_type") or e.get("type") or "").upper()
     if t not in ("TEXT", "MTEXT", "MLEADER", "LEADER"):
         return False
-    return bool(_TITLE_TEXT_RE.search(_entity_text(e)))
+    text = _entity_text(e)
+    return bool(_TITLE_TEXT_RE.search(text) or _TITLE_TEXT_FALLBACK_RE.search(text))
 
 
-def _is_pipe_annotation_text_entity(e: dict) -> bool:
+def _is_pipe_annotation_text_entity(e: dict, *, pipe_context: bool = False) -> bool:
     t = str(e.get("raw_type") or e.get("type") or "").upper()
     if t not in ("TEXT", "MTEXT", "MLEADER", "LEADER"):
         return False
-    return bool(_PIPE_ANNOTATION_TEXT_RE.search(_entity_text(e)))
+    if _is_title_text_entity(e):
+        return False
+    text = _entity_text(e)
+    if _PIPE_ANNOTATION_TEXT_RE.search(text):
+        return True
+    if not pipe_context:
+        return False
+    return bool(_is_pipe_size_annotation_text(text) or _SANITARY_SYMBOL_TEXT_RE.match(text))
 
 
 def _is_room_label_text_entity(e: dict) -> bool:
@@ -233,6 +288,27 @@ def _entity_title_extents(e: dict) -> tuple[float, float, float, float] | None:
     return None
 
 
+def _entity_extents_max_dim(e: dict) -> float:
+    ext = _entity_title_extents(e)
+    if not ext:
+        return 0.0
+    return max(abs(ext[2] - ext[0]), abs(ext[3] - ext[1]))
+
+
+def _is_large_generic_block(e: dict) -> bool:
+    t = str(e.get("raw_type") or e.get("type") or "").upper()
+    if t not in ("INSERT", "BLOCK"):
+        return False
+    if _entity_extents_max_dim(e) <= _PIPE_ANNOTATION_BLOCK_MAX_DIM:
+        return False
+    mep_score, _ = _score_entity_for_mep_context(e)
+    if mep_score >= 0.7:
+        return False
+    layer = _entity_layer(e).strip()
+    block_name = str(e.get("name") or e.get("block_name") or e.get("effective_name") or "").strip()
+    return bool(_GENERIC_LAYER_NAME_RE.match(layer) or block_name)
+
+
 def _extents_near(
     a: tuple[float, float, float, float] | None,
     b: tuple[float, float, float, float] | None,
@@ -262,6 +338,8 @@ def _is_near_pipe_annotation(e: dict, pipe_extents: list[tuple[float, float, flo
     t = str(e.get("raw_type") or e.get("type") or "").upper()
     if t not in ("LINE", "POLYLINE", "LWPOLYLINE", "ARC", "SPLINE", "INSERT", "BLOCK"):
         return False
+    if _is_large_generic_block(e):
+        return False
     e_ext = _entity_title_extents(e)
     return any(_extents_near(e_ext, pipe_ext, _PIPE_ANNOTATION_GRAPHIC_NEAR_TOL) for pipe_ext in pipe_extents)
 
@@ -282,6 +360,7 @@ def split_entities_by_layer_role(
     건축 배경(많은 선분, 적은 텍스트/블록)인지 판단하는 2차 분류를 수행합니다.
     """
     # 1단계: 레이어별 통계 수집
+    pipe_context = _drawing_has_pipe_context(drawing_data, entities or [])
     layer_stats: dict[str, dict[str, Any]] = {}
     for e in entities or []:
         ln = _entity_layer(e)
@@ -352,9 +431,6 @@ def split_entities_by_layer_role(
                 up_n = ln.upper()
                 has_mep_keyword = any(kw in up_n for kw in _MEP_KEYWORDS)
                 
-                # [특수 규칙] L1, L2... 처럼 L로 시작하는 레이어는 배관 키워드가 없으면 건축일 확률이 높음
-                is_l_layer = bool(re.match(r"^L(?:\d|[-_])", ln, re.IGNORECASE))
-                
                 # [색상 기반 보호] 회색이 아닌 유색(녹색, 붉은색 등) 레이어는 선분이 많아도 건축물보다는 배관일 확률이 높음
                 is_vivid_color = l_color not in _ARCH_ACI_COLORS and l_color != "" and l_color != "7" # 7은 흰색/검은색
                 
@@ -364,7 +440,7 @@ def split_entities_by_layer_role(
                 if has_mep_keyword or (global_has_mep_keyword and is_vivid_color):
                     # 이 경우 배관 후보(unknown)로 남겨두어 검토 대상에 포함시킴
                     pass
-                elif not is_vivid_color and (line_ratio > 0.60 or is_l_layer):
+                elif not is_vivid_color and line_ratio > 0.60:
                     # 키워드도 없고 색상도 무채색인데 선분만 많으면 건축으로 확정
                     # 단, 블록(blocks)이 하나라도 있다면 설비 심볼일 수 있으므로 제외
                     if stats.get("blocks", 0) == 0:
@@ -374,7 +450,7 @@ def split_entities_by_layer_role(
                         pass
                 elif line_ratio > 0.95 and not is_vivid_color:
                     # 선분이 압도적이고 무채색이면 건축
-                    # 단, blocks나 texts가 있으면 TEX처럼 별도 분류된 심볼/주석이 있을 수 있으므로 unknown 유지
+                    # 단, blocks나 texts가 있으면 별도 분류된 심볼/주석이 있을 수 있으므로 unknown 유지
                     if stats.get("blocks", 0) == 0 and stats.get("texts", 0) == 0:
                         role = "arch"
             else:
@@ -389,9 +465,8 @@ def split_entities_by_layer_role(
         msg = f"[LayerSplit Debug] Layer: {ln} | Stats: {type_counts} | Total: {stats['total']} | LineRatio: {(stats['lines'] / stats['total'] if stats['total'] > 0 else 0):.2f} | FinalRole: {layer_resolved_roles[ln]}"
         logging.info(msg)
         
-        # L 계열이거나 건축인 경우 상세 정보 콘솔 출력
-        is_l_layer = bool(re.match(r"^L(?:\d|[-_])", ln, re.IGNORECASE))
-        if is_l_layer or layer_resolved_roles[ln] == "arch":
+        # 건축으로 분류된 경우 상세 정보 콘솔 출력
+        if layer_resolved_roles[ln] == "arch":
             print(msg)
 
     # 3단계: 엔티티 분리
@@ -409,7 +484,7 @@ def split_entities_by_layer_role(
     pipe_annotation_extents = [
         ext
         for e in entities
-        if isinstance(e, dict) and _is_pipe_annotation_text_entity(e)
+        if isinstance(e, dict) and _is_pipe_annotation_text_entity(e, pipe_context=pipe_context)
         for ext in [_entity_title_extents(e)]
         if ext is not None
     ]
@@ -429,22 +504,30 @@ def split_entities_by_layer_role(
             continue
 
         e_type = str(e.get("raw_type") or e.get("type") or "").upper()
-        if e_type in ("TEXT", "MTEXT", "MLEADER", "LEADER") and not _is_pipe_annotation_text_entity(e):
+        if (
+            e_type in ("TEXT", "MTEXT", "MLEADER", "LEADER")
+            and _is_pipe_annotation_text_entity(e, pipe_context=pipe_context)
+        ):
+            e = {**e, "metadata_role": "pipe_annotation"}
+
+        if (
+            e_type in ("TEXT", "MTEXT", "MLEADER", "LEADER")
+            and not _is_pipe_annotation_text_entity(e, pipe_context=pipe_context)
+        ):
             aux.append({**e, "layer_role": "aux", "metadata_role": "general_text"})
             continue
 
-        # [L-layer 내 엔티티 타입 분리]
-        # L4처럼 한 레이어에 건축 배경과 배관 주석/선이 섞이는 도면이 있다.
-        # L3처럼 레이어 전체가 unknown인 경우도 초록/빨강 등 유색 배관선이 섞인다.
-        # 레이어 전체가 arch이면 LINE은 건축 기준선으로만 남긴다. 같은 L-layer 안의 BLOCK/TEXT만
+        # [혼합 레이어 내 엔티티 타입 분리]
+        # 한 레이어에 건축 배경과 배관 주석/선이 섞이는 도면이 있다.
+        # 레이어 전체가 arch이면 LINE은 건축 기준선으로만 남긴다. 같은 레이어 안의 BLOCK/TEXT만
         # 배관 문맥 후보로 승격하여 벽체/문선이 검토 박스로 잡히는 오탐을 막는다.
-        if role in ("arch", "unknown") and re.match(r"^L(?:\d|[-_])", ln, re.IGNORECASE):
+        if role in ("arch", "unknown"):
             is_line_type = e_type in ("LINE", "POLYLINE", "LWPOLYLINE", "ARC", "SPLINE")
             is_block_text = e_type in ("INSERT", "BLOCK", "TEXT", "MTEXT", "MLEADER", "LEADER")
 
             if is_block_text:
                 # BLOCK/TEXT는 MEP 점수 계산 후 review로 이동
-                mep_score, indicator = _score_entity_for_mep_in_l_layer(e)
+                mep_score, indicator = _score_entity_for_mep_context(e)
                 near_pipe_annotation = _is_near_pipe_annotation(e, pipe_annotation_extents)
                 if mep_score >= 0.7 or near_pipe_annotation:
                     e = {**e,
@@ -454,29 +537,30 @@ def split_entities_by_layer_role(
                          "source_layer_role": role,
                          "layer_role": "mep"}
                     logging.debug(
-                        "[LayerSplit] L-layer block/text → review: Layer=%s, Type=%s, Entity=%s, Score=%.2f, NearAnn=%s",
+                        "[LayerSplit] mixed-layer block/text → review: Layer=%s, Type=%s, Entity=%s, Score=%.2f, NearAnn=%s",
                         ln, e_type, e.get("name", e.get("text", "?")), mep_score, near_pipe_annotation,
                     )
                     review.append(e)
                     continue
             if is_line_type and role != "arch":
-                mep_score, indicator = _score_entity_for_mep_in_l_layer(e)
+                mep_score, indicator = _score_entity_for_mep_context(e)
                 near_pipe_annotation = _is_near_pipe_annotation(e, pipe_annotation_extents)
-                # 색상 단독 판정 금지. unknown L-layer 선도 배관 주석/명시 근거 주변일 때만 살린다.
+                # 색상 단독 판정 금지. unknown 선도 배관 주석/명시 근거 주변일 때만 살린다.
                 if near_pipe_annotation:
                     e = {**e,
                          "entity_mep_score": mep_score,
                          "entity_mep_indicator": indicator or "near_pipe_annotation",
-                         "flag_for_piping_agent": True,
-                         "source_layer_role": role,
-                         "layer_role": "mep"}
+                         "topology_pipe_evidence": "near_pipe_annotation",
+                         "source_layer_role": role}
+                    if mep_score >= 0.6:
+                        e = {**e, "flag_for_piping_agent": True, "layer_role": "mep"}
                     logging.debug(
-                        "[LayerSplit] L-layer line near pipe annotation → review: Layer=%s, Type=%s, Handle=%s, Score=%.2f, Indicator=%s",
+                        "[LayerSplit] mixed-layer line near pipe annotation → review: Layer=%s, Type=%s, Handle=%s, Score=%.2f, Indicator=%s",
                         ln, e_type, e.get("handle", "?"), mep_score, indicator or "near_pipe_annotation",
                     )
                     review.append(e)
                     continue
-            # arch L-layer LINE 계열은 아래 arch로 그대로 낙하
+            # arch LINE 계열은 아래 arch로 그대로 낙하
 
         if role == "arch":
             arch.append(e)
@@ -501,6 +585,25 @@ def _filter_by_handles(entities: list[dict], handles: set[str]) -> list[dict]:
     if not handles:
         return list(entities)
     return [e for e in entities if str(e.get("handle", "")) in handles]
+
+
+def _append_pipe_annotation_text_context(
+    target: list[dict],
+    candidates: list[dict],
+    *,
+    pipe_context: bool = False,
+) -> list[dict]:
+    """Keep pipe annotation TEXT context available after focus/active filtering."""
+    seen = {str(e.get("handle") or "") for e in target if isinstance(e, dict)}
+    out = list(target)
+    for e in candidates:
+        h = str(e.get("handle") or "")
+        if not h or h in seen:
+            continue
+        if _is_pipe_annotation_text_entity(e, pipe_context=pipe_context):
+            out.append(e)
+            seen.add(h)
+    return out
 
 
 def _bbox_extents(b: dict[str, Any] | None) -> tuple[float, float, float, float] | None:
@@ -723,6 +826,7 @@ def build_pipe_review_layout(
 
     raw = drawing_data.get("entities") or drawing_data.get("elements") or []
     entities: list[dict] = [e for e in raw if isinstance(e, dict)]
+    pipe_context = _drawing_has_pipe_context(drawing_data, entities)
 
     arch_all, mep_all, aux_list, unknown_only, layer_resolved_roles = split_entities_by_layer_role(
         entities,
@@ -759,7 +863,7 @@ def build_pipe_review_layout(
         if meta in ("general_text", "title_block"):
             _bump_text_role(e, meta)
     for e in mep_all:
-        if _is_pipe_annotation_text_entity(e):
+        if _is_pipe_annotation_text_entity(e, pipe_context=pipe_context):
             _bump_text_role(e, "pipe_annotation")
 
     target_mep = list(mep_all)
@@ -770,8 +874,14 @@ def build_pipe_review_layout(
             if isinstance(e, dict) and e.get("handle")
         }
         target_mep = _filter_by_handles(mep_all, fh)
+        target_mep = _append_pipe_annotation_text_context(
+            target_mep, mep_all, pipe_context=pipe_context
+        )
     elif active_ids:
         target_mep = _filter_by_handles(mep_all, set(active_ids))
+        target_mep = _append_pipe_annotation_text_context(
+            target_mep, mep_all, pipe_context=pipe_context
+        )
 
     layer_name_roles = _build_layer_name_roles(entities, db_role_map, ncs_mep_prefix)
     layers_indexed = _build_layers_indexed(drawing_data, layer_name_roles)

@@ -223,7 +223,13 @@ class FireAgent(BaseAgent):
                 fixes = result.get("fixes") or []
                 
                 violations = self._format_violations(items)
-                pending_fixes = self._build_pending_fixes(fixes, items)
+                entities_list = drawing_data.get("entities") or drawing_data.get("elements") or []
+                entity_by_id: dict = {}
+                for e in entities_list:
+                    key = e.get("handle") or e.get("id")
+                    if key:
+                        entity_by_id[str(key)] = e
+                pending_fixes = self._build_pending_fixes(fixes, items, entity_by_id)
                 referenced_laws = list({v.get("legal_reference") for v in violations if v.get("legal_reference")})
                 
                 summary = report.get("summary", {})
@@ -271,22 +277,42 @@ class FireAgent(BaseAgent):
             for i in items
         ]
 
-    def _build_pending_fixes(self, fixes: list, report_items: list) -> list:
+    def _build_pending_fixes(self, fixes: list, report_items: list, entity_by_id: dict | None = None) -> list:
         """
         수정 제안 사항들을 사용자 승인 대기(Pending Fix) 목록으로 변환합니다.
+        entity_by_id가 주어지면 엔티티의 bbox를 proposed_fix._entity_bbox에 저장해
+        재검토 시 RevCloud 위치 복원에 활용한다.
         """
         violation_map = {i.get("equipment_id"): i for i in report_items}
         result = []
         for fix in fixes:
             eq_id = fix.get("equipment_id")
             violation = violation_map.get(eq_id, {})
+            proposed = dict(fix.get("proposed_fix") or {})
+            if entity_by_id and eq_id:
+                ent = entity_by_id.get(str(eq_id))
+                if ent and isinstance(ent.get("bbox"), dict):
+                    proposed["_entity_bbox"] = ent["bbox"]
+            if not proposed.get("_entity_bbox") and str(proposed.get("action") or "").upper() == "CREATE_BLOCK":
+                try:
+                    bx = float(proposed.get("base_x"))
+                    by = float(proposed.get("base_y"))
+                    pad = 1_000.0
+                    proposed["_entity_bbox"] = {
+                        "x1": bx - pad,
+                        "y1": by - pad,
+                        "x2": bx + pad,
+                        "y2": by + pad,
+                    }
+                except (TypeError, ValueError):
+                    pass
             result.append({
                 "fix_id": str(uuid.uuid4()),
                 "equipment_id": eq_id,
                 "violation_type": violation.get("violation_type"),
-                "action": fix.get("proposed_fix", {}).get("action"),
-                "description": violation.get("reason") or fix.get("proposed_fix", {}).get("reason"),
-                "proposed_fix": fix.get("proposed_fix"),
+                "action": proposed.get("action"),
+                "description": violation.get("reason") or proposed.get("reason"),
+                "proposed_fix": proposed,
             })
         return result
 

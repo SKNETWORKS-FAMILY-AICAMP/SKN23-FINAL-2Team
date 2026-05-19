@@ -26,6 +26,7 @@ Modification History :
 
 import json
 import logging
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -87,12 +88,56 @@ class DomainClassifier:
             logger.error(f"레이블 인코더 없음: {encoder_path}")
             return
 
-        self._model   = joblib.load(model_path)
-        self._encoder = joblib.load(encoder_path)
-
         if meta_path.exists():
             with open(meta_path, encoding="utf-8") as f:
                 self._meta = json.load(f)
+
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=UserWarning, module=r"xgboost(\.|$)")
+                self._model   = joblib.load(model_path)
+                self._encoder = joblib.load(encoder_path)
+        except ModuleNotFoundError as exc:
+            missing = getattr(exc, "name", "") or str(exc)
+            logger.info(
+                "도메인 ML 분류기 선택 의존성 없음(%s) — RuleClassifier 전용 모드로 동작",
+                missing,
+            )
+            self._model = None
+            self._encoder = None
+            self._loaded = False
+            return
+        except ImportError as exc:
+            logger.info(
+                "도메인 ML 분류기 로드 불가(%s) — RuleClassifier 전용 모드로 동작",
+                exc,
+            )
+            self._model = None
+            self._encoder = None
+            self._loaded = False
+            return
+
+        n_features = int(self._meta.get("n_features") or 0)
+        if n_features and hasattr(self._model, "predict_proba"):
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=UserWarning, module=r"xgboost(\.|$)")
+                    self._model.predict_proba(np.zeros((1, n_features)))
+            except Exception as exc:
+                logger.info(
+                    "도메인 ML 분류기 sanity check 실패(%s) — RuleClassifier 전용 모드로 동작",
+                    exc,
+                )
+                self._model = None
+                self._encoder = None
+                self._loaded = False
+                return
+        elif n_features:
+            logger.info("도메인 ML 분류기에 predict_proba 없음 — RuleClassifier 전용 모드로 동작")
+            self._model = None
+            self._encoder = None
+            self._loaded = False
+            return
 
         self._loaded = True
         # rule_classifier_coverage_pct 는 0~100 스케일의 percentage 값 (예: 0.51 = 0.51%)
@@ -111,7 +156,7 @@ class DomainClassifier:
             pred_encoded = self._model.predict(feat)
             return str(self._encoder.inverse_transform(pred_encoded)[0])
         except Exception as e:
-            logger.error(f"ML 분류 오류: {e} — 폴백 'arch' 반환")
+            logger.info(f"ML 분류 오류: {e} — 폴백 'arch' 반환")
             return "arch"
 
     def _ml_predict_proba(self, cad_json: dict) -> dict[str, float]:
@@ -121,7 +166,7 @@ class DomainClassifier:
             proba = self._model.predict_proba(feat)[0]
             return {str(cls): float(p) for cls, p in zip(self._encoder.classes_, proba)}
         except Exception as e:
-            logger.error(f"ML 확률 추론 오류: {e}")
+            logger.info(f"ML 확률 추론 오류: {e}")
             return {d: 0.25 for d in DOMAIN_LABELS}
 
     # ──────────────────────────────────────────────────────────────────────
@@ -157,7 +202,7 @@ class DomainClassifier:
             return rule_result
 
         if not self._loaded:
-            logger.warning("분류기 미로드 — 폴백 도메인 'arch' 반환")
+            logger.debug("분류기 미로드 — 폴백 도메인 'arch' 반환")
             return "arch"
 
         return self._ml_predict(cad_json)
@@ -178,7 +223,7 @@ class DomainClassifier:
             return {rule_result: 1.0}
 
         if not self._loaded:
-            logger.warning("분류기 미로드 — 균등 확률 반환")
+            logger.debug("분류기 미로드 — 균등 확률 반환")
             return {d: 0.25 for d in DOMAIN_LABELS}
 
         return self._ml_predict_proba(cad_json)
@@ -200,7 +245,7 @@ class DomainClassifier:
             return [r for r in results]  # type: ignore[return-value]
 
         if not self._loaded:
-            logger.warning("분류기 미로드 — 폴백 'arch' 반환")
+            logger.debug("분류기 미로드 — 폴백 'arch' 반환")
             for i in ml_indices:
                 results[i] = "arch"
             return results  # type: ignore[return-value]
@@ -212,7 +257,7 @@ class DomainClassifier:
             pred_encoded = self._model.predict(feats)
             ml_labels = [str(d) for d in self._encoder.inverse_transform(pred_encoded)]
         except Exception as e:
-            logger.error(f"배치 ML 분류 오류: {e}")
+            logger.info(f"배치 ML 분류 오류: {e}")
             ml_labels = ["arch"] * len(ml_indices)
 
         for idx, label in zip(ml_indices, ml_labels):

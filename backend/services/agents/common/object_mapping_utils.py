@@ -20,8 +20,30 @@ from backend.services.agents.common.multi_object_mapper import (
 
 _log = logging.getLogger(__name__)
 
+_REPORT_ENTITY_TYPES = (
+    "LINE",
+    "POLYLINE",
+    "LWPOLYLINE",
+    "ARC",
+    "CIRCLE",
+    "TEXT",
+    "MTEXT",
+    "DIMENSION",
+)
+
+_REPORT_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
+    "LINE": ("start", "end"),
+    "POLYLINE": ("vertices",),
+    "LWPOLYLINE": ("vertices",),
+    "ARC": ("center", "radius"),
+    "CIRCLE": ("center", "radius"),
+    "TEXT": ("text",),
+    "MTEXT": ("text",),
+    "DIMENSION": ("measurement",),
+}
+
 # ── 도메인별 레이어 보너스 (공용 상수) ────────────────────────────────────────
-# (과거 L4 등 특정 레이어 가산점이 있었으나, 모호성 제거를 위해 보수적으로 운영)
+# (과거 특정 레이어 가산점이 있었으나, 모호성 제거를 위해 보수적으로 운영)
 PIPE_LAYER_BONUS = None
 ELEC_LAYER_BONUS = None
 ARCH_LAYER_BONUS = LayerBonusConfig(block_layer="A-AREA", text_layer="A-ANNO", bonus=15.0)
@@ -44,6 +66,196 @@ def _get_mapping_sem() -> asyncio.Semaphore:
 def _clean_text(raw: str) -> str:
     """MTEXT RTF escape 제거 후 실제 텍스트 반환."""
     return re.sub(r"\\[A-Za-z0-9]+;", "", raw).strip()
+
+
+def build_drawing_test_report(
+    drawing_data: dict | list[dict],
+    *,
+    max_samples: int = 20,
+) -> dict[str, Any]:
+    from backend.services.agents.elec.sub.elec_attr_extractor import extract_elec_attrs
+
+    elements = _report_elements(drawing_data)
+    entity_counts = {key: 0 for key in _REPORT_ENTITY_TYPES}
+    dimension_measurements: list[float | int] = []
+    electrical_annotations = {
+        "wire_size": [],
+        "cable_sqmm": [],
+        "pole_options": [],
+        "poles": [],
+        "bolt_size": [],
+        "label_keys": [],
+    }
+    parser_missing_fields: list[dict[str, Any]] = []
+    sample_entities: list[dict[str, Any]] = []
+
+    for el in elements:
+        raw_type = str(el.get("raw_type") or el.get("type") or "").upper()
+        if raw_type in entity_counts:
+            entity_counts[raw_type] += 1
+
+        missing = _missing_report_fields(el, raw_type)
+        if missing:
+            parser_missing_fields.append({
+                "handle": str(el.get("handle") or el.get("id") or ""),
+                "type": raw_type,
+                "missing": missing,
+            })
+
+        if raw_type == "DIMENSION":
+            measurement = _report_float(el.get("measurement"))
+            if measurement is None:
+                measurement = _first_number(str(el.get("text") or el.get("content") or ""))
+            if measurement is not None:
+                dimension_measurements.append(_compact_number(measurement))
+
+        text = str(el.get("text") or el.get("content") or "").strip()
+        if text:
+            _merge_annotation_attrs(electrical_annotations, extract_elec_attrs(text))
+
+        if isinstance(el.get("elec_attrs"), dict):
+            _merge_annotation_attrs(electrical_annotations, el["elec_attrs"])
+
+        if len(sample_entities) < max_samples and raw_type in _REPORT_ENTITY_TYPES:
+            sample_entities.append(_sample_entity(el, raw_type))
+
+    topology = None
+    if isinstance(drawing_data, dict):
+        topology = drawing_data.get("elec_topology") or drawing_data.get("topology")
+    terminal_candidates = []
+    if isinstance(topology, dict):
+        terminal_candidates = topology.get("terminal_candidates") or []
+    if not terminal_candidates:
+        try:
+            from backend.services.agents.elec.sub.topology import detect_terminal_candidates
+
+            terminal_candidates = detect_terminal_candidates(elements)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("[DrawingTestReport] terminal candidate fallback failed: %s", exc)
+    total_entity_count = sum(entity_counts.values())
+    critical_flags = [
+        flag
+        for flag in _qa_flags(entity_counts, dimension_measurements, electrical_annotations)
+        if flag in {"dimension_without_measurement", "text_without_electrical_annotation"}
+    ]
+
+    return {
+        "entity_counts": entity_counts,
+        "dimension_measurements": _unique_keep_order(dimension_measurements),
+        "electrical_annotations": electrical_annotations,
+        "parser_missing_fields": parser_missing_fields,
+        "terminal_candidates": terminal_candidates,
+        "summary": {
+            "total_entity_count": total_entity_count,
+            "terminal_candidate_count": len(terminal_candidates),
+            "parser_missing_field_count": len(parser_missing_fields),
+            "critical_qa_flag_count": len(critical_flags),
+        },
+        "qa_flags": _qa_flags(entity_counts, dimension_measurements, electrical_annotations),
+        "sample_entities": sample_entities,
+    }
+
+
+def _report_elements(drawing_data: dict | list[dict]) -> list[dict]:
+    if isinstance(drawing_data, list):
+        return [e for e in drawing_data if isinstance(e, dict)]
+    if not isinstance(drawing_data, dict):
+        return []
+    mep_review = drawing_data.get("mep_review") if isinstance(drawing_data.get("mep_review"), dict) else {}
+    raw = (
+        drawing_data.get("entities")
+        or drawing_data.get("elements")
+        or drawing_data.get("clean_entities")
+        or mep_review.get("entities")
+        or []
+    )
+    return [e for e in raw if isinstance(e, dict)]
+
+
+def _missing_report_fields(el: dict, raw_type: str) -> list[str]:
+    missing = []
+    for field in _REPORT_REQUIRED_FIELDS.get(raw_type, ()):
+        if field == "vertices" and (el.get("vertices") or el.get("points")):
+            continue
+        if field == "text" and (el.get("text") or el.get("content")):
+            continue
+        if field == "measurement" and (
+            el.get("measurement") is not None
+            or _first_number(str(el.get("text") or el.get("content") or "")) is not None
+        ):
+            continue
+        if el.get(field) is None:
+            missing.append(field)
+    return missing
+
+
+def _merge_annotation_attrs(target: dict[str, list], attrs: dict[str, Any]) -> None:
+    if attrs.get("wire_size"):
+        _append_unique(target["wire_size"], str(attrs["wire_size"]))
+    if attrs.get("cable_sqmm") is not None:
+        _append_unique(target["cable_sqmm"], _compact_number(float(attrs["cable_sqmm"])))
+    for pole in attrs.get("pole_options") or []:
+        _append_unique(target["pole_options"], str(pole))
+        _append_unique(target["poles"], str(pole))
+    if attrs.get("bolt_size"):
+        _append_unique(target["bolt_size"], str(attrs["bolt_size"]))
+    for key in attrs.get("label_keys") or []:
+        _append_unique(target["label_keys"], str(key))
+
+
+def _sample_entity(el: dict, raw_type: str) -> dict[str, Any]:
+    keys = (
+        "handle", "id", "type", "raw_type", "layer", "position", "start", "end",
+        "vertices", "center", "radius", "measurement", "text", "insert_point",
+    )
+    sample = {k: el[k] for k in keys if k in el}
+    sample.setdefault("type", raw_type)
+    return sample
+
+
+def _qa_flags(
+    entity_counts: dict[str, int],
+    measurements: list[float | int],
+    annotations: dict[str, list],
+) -> list[str]:
+    flags: list[str] = []
+    if entity_counts.get("DIMENSION", 0) and not measurements:
+        flags.append("dimension_without_measurement")
+    if (entity_counts.get("TEXT", 0) or entity_counts.get("MTEXT", 0)) and not any(
+        annotations[k] for k in ("wire_size", "pole_options", "bolt_size", "label_keys")
+    ):
+        flags.append("text_without_electrical_annotation")
+    if entity_counts.get("CIRCLE", 0) and entity_counts["CIRCLE"] < 4:
+        flags.append("circle_count_below_terminal_candidate_min")
+    return flags
+
+
+def _report_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_number(text: str) -> float | None:
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", text or "")
+    return float(match.group(0)) if match else None
+
+
+def _compact_number(value: float) -> float | int:
+    return int(value) if float(value).is_integer() else value
+
+
+def _append_unique(target: list, value: Any) -> None:
+    if value not in target:
+        target.append(value)
+
+
+def _unique_keep_order(values: list[Any]) -> list[Any]:
+    result: list[Any] = []
+    for value in values:
+        _append_unique(result, value)
+    return result
 
 
 # ── node 파일용: drawing_data → 엔티티 추출 → 매핑 ───────────────────────────
@@ -83,7 +295,7 @@ async def run_object_mapping(
     arch_handles: set[str] = set()
     if filter_arch_layers:
         from backend.services.arch_pipe_layer_split import split_entities_by_layer_role
-        # 고도화된 통계 기반 분류기 사용 (L4, L3 등 대응)
+        # 고도화된 통계 기반 분류기 사용 (프로젝트별 혼합 레이어 대응)
         arch_list, _, _, _, _ = split_entities_by_layer_role(
             raw, drawing_data=drawing_data
         )

@@ -96,10 +96,23 @@ class S3Manager:
     
     def _upload_file_sync(self, s3_key: str, file_obj: UploadFile, use_kms: bool = False) -> str:
         """실제 파일을 S3에 업로드하는 동기 함수 (KMS 지원)"""
+        try:
+            file_obj.file.seek(0)
+        except (AttributeError, OSError):
+            pass
+
+        body = file_obj.file.read()
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        if not body:
+            raise ValueError(f"S3 upload source file is empty: {s3_key}")
+
         upload_kwargs = {
             'Bucket': self.bucket_name,
             'Key': s3_key,
-            'Body': file_obj.file,
+            'Body': body,
+            'ContentLength': len(body),
+            'ContentType': getattr(file_obj, "content_type", None) or "application/octet-stream",
             'ServerSideEncryption': 'AES256'
         }
         
@@ -108,6 +121,12 @@ class S3Manager:
             upload_kwargs['SSEKMSKeyId'] = self.kms_key_id
 
         self.s3_client.put_object(**upload_kwargs)
+        uploaded_size = self.head_object_size(s3_key)
+        if uploaded_size != len(body):
+            raise RuntimeError(
+                f"S3 upload verification failed for {s3_key}: "
+                f"expected {len(body)} bytes, got {uploaded_size}"
+            )
         return f"s3://{self.bucket_name}/{s3_key}"
 
     async def upload_file_async(self, s3_key: str, file_obj: UploadFile, use_kms: bool = False) -> str:
@@ -121,3 +140,40 @@ class S3Manager:
             Params={'Bucket': self.bucket_name, 'Key': s3_key},
             ExpiresIn=expiration,
         )
+
+    def generate_presigned_put_url(self, s3_key: str, expiration: int = 900) -> str:
+        """C#이 S3에 직접 PUT 업로드하기 위한 presigned URL. ContentType을 고정해야 검증이 일치한다."""
+        return self.s3_client.generate_presigned_url(
+            "put_object",
+            Params={"Bucket": self.bucket_name, "Key": s3_key, "ContentType": "application/json"},
+            ExpiresIn=expiration,
+        )
+
+    def head_object_size(self, s3_key: str) -> int | None:
+        """S3 객체 존재 여부와 크기 반환. 없으면 None."""
+        try:
+            resp = self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
+            return resp["ContentLength"]
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code in ("404", "NoSuchKey"):
+                return None
+            raise
+
+    def s3_uri_from_key(self, s3_key: str) -> str:
+        """s3://bucket/key 형식 URI 반환. Redis currentSnapshotPath/latestDeltaPath 저장용."""
+        return f"s3://{self.bucket_name}/{s3_key}"
+
+    def s3_key_from_uri(self, s3_uri: str) -> str:
+        """s3://bucket/key → key 변환. S3 HEAD 검증용."""
+        prefix = f"s3://{self.bucket_name}/"
+        if not s3_uri.startswith("s3://"):
+            return s3_uri
+        if not s3_uri.startswith(prefix):
+            raise ValueError(f"URI가 이 버킷({self.bucket_name})을 가리키지 않습니다: {s3_uri}")
+        return s3_uri[len(prefix):]
+
+    async def load_json(self, s3_uri: str) -> dict:
+        """s3_uri(s3://bucket/key) 또는 s3_key로 JSON 로드."""
+        key = self.s3_key_from_uri(s3_uri)
+        return await self.download_json_async(key)

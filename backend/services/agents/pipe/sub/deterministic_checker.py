@@ -34,6 +34,7 @@ _WATER_VEL_MAX =  3.0
 # 배관 방향 직교 허용 오차 (±5°)
 _SLOPE_ORTH_TOL_DEG = 5.0
 _CONTINUITY_MIN_LENGTH_MM = 500.0
+_GENERIC_CONNECTABLE_MIN_MM = 1500.0
 
 # ── 도메인 판별용 ACI 색상 인덱스 ───────────────────────────────────────────
 _ACI_ARCH_COLORS: frozenset[int] = frozenset({8, 9, 250, 251, 252, 253, 254, 255})
@@ -45,6 +46,9 @@ _PIPE_LAYER_STRONG_RE = re.compile(
     r"GAS|PIPE|PIPING|배관|급수|급탕|배수|위생|소화|SPRINK|CWS|HWS|FIRE|^P[-_]|^M[-_]",
     re.IGNORECASE,
 )
+
+
+_GENERIC_LAYER_RE = re.compile(r"^(?:L\d+|LAYER\d*|\d+)$", re.IGNORECASE)
 
 
 def _is_arch_element(el: dict) -> bool:
@@ -89,11 +93,45 @@ def _has_explicit_pipe_attrs(el: dict) -> bool:
     )
 
 
+def _excluded_from_pipe_continuity(el: dict) -> bool:
+    return bool(
+        el.get("exclude_from_pipe_topology")
+        or str(el.get("connectivity_role") or "").lower() == "symbol"
+        or str(el.get("geometry_role") or "").lower() == "pipe_symbol"
+    )
+
+
+def _run_length_mm(run: dict) -> float:
+    try:
+        return float(run.get("total_length_mm") or run.get("total_length") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _is_short_generic_continuity_candidate(el: dict, run: dict | None = None, length_mm: float | None = None) -> bool:
+    layer = str(el.get("layer") or "")
+    if not _GENERIC_LAYER_RE.match(layer):
+        return False
+    if _PIPE_LAYER_STRONG_RE.search(layer):
+        return False
+    length = length_mm if length_mm is not None else _run_length_mm(run or {})
+    return length < _GENERIC_CONNECTABLE_MIN_MM
+
+
 def _has_strong_continuity_evidence(el: dict, run: dict) -> bool:
     """연속성 위반은 실제 배관임이 강한 경우에만 보고한다."""
+    if _excluded_from_pipe_continuity(el):
+        return False
+    if _is_short_generic_continuity_candidate(el, run):
+        return False
+    layer = str(el.get("layer") or "")
+    generic_layer = bool(_GENERIC_LAYER_RE.match(layer))
+    if generic_layer and str(el.get("source_attributes") or "").lower() == "text_extracted":
+        return False
+    if generic_layer and not _has_explicit_pipe_attrs(el):
+        return False
     if _has_explicit_pipe_attrs(el):
         return True
-    layer = str(el.get("layer") or "")
     if _PIPE_LAYER_STRONG_RE.search(layer):
         return True
     material = str(run.get("material") or "").upper()
@@ -221,6 +259,8 @@ def run_deterministic_checks(
             continue
         if length_mm < _CONTINUITY_MIN_LENGTH_MM:
             continue
+        if _is_short_generic_continuity_candidate(el, run, length_mm):
+            continue
         if not _has_strong_continuity_evidence(el, run):
             continue
         layer = el.get("layer", "")
@@ -246,6 +286,11 @@ def run_deterministic_checks(
         ea = el_map.get(ha, {})
         eb = el_map.get(hb, {})
         if _is_arch_element(ea) or _is_arch_element(eb):
+            continue
+        if (
+            _is_short_generic_continuity_candidate(ea, run_by_handle.get(ha, {}))
+            or _is_short_generic_continuity_candidate(eb, run_by_handle.get(hb, {}))
+        ):
             continue
         if not (
             _has_strong_continuity_evidence(ea, run_by_handle.get(ha, {}))
@@ -275,6 +320,11 @@ def run_deterministic_checks(
         ea = el_map.get(endpoint_handle, {})
         eb = el_map.get(segment_handle, {})
         if _is_arch_element(ea) or _is_arch_element(eb):
+            continue
+        if (
+            _is_short_generic_continuity_candidate(ea, run_by_handle.get(endpoint_handle, {}))
+            or _is_short_generic_continuity_candidate(eb, run_by_handle.get(segment_handle, {}))
+        ):
             continue
         if not (
             _has_strong_continuity_evidence(ea, run_by_handle.get(endpoint_handle, {}))
@@ -331,7 +381,8 @@ def run_deterministic_checks(
         for b2 in blocks[i + 1:]:
             p2 = b2.get("position") or b2.get("insert_point")
             d = _dist2d(p1, p2)
-            if d <= _DUP_POSITION_TOL_MM * unit_factor:
+            d_mm = d * unit_factor
+            if d_mm <= _DUP_POSITION_TOL_MM:
                 key = tuple(sorted([b1["handle"], b2["handle"]]))
                 if key in dup_pairs:
                     continue
@@ -341,9 +392,9 @@ def run_deterministic_checks(
                     violation_type="duplicate_equipment_position",
                     reason=(
                         f"블록 위치 중복 — {b1['handle']!r}와 {b2['handle']!r}가 "
-                        f"{d:.1f}mm 이내 동일 좌표에 배치됨. 중복 삽입 오류로 의심됩니다."
+                        f"{d_mm:.1f}mm 이내 동일 좌표에 배치됨. 중복 삽입 오류로 의심됩니다."
                     ),
-                    current_value=f"블록 간 거리 {d:.1f}mm",
+                    current_value=f"블록 간 거리 {d_mm:.1f}mm",
                     required_value=f"{_DUP_POSITION_TOL_MM}mm 초과 (위치 분리 필요)",
                     reference_rule="설비 배치 원칙 — 동일 위치에 두 설비를 중복 배치하면 안 됨",
                     confidence_score=1.0,
@@ -408,13 +459,13 @@ def run_deterministic_checks(
         if _is_arch_element(el):
             continue
         temp = el.get("temp_c")
-        if temp is None or float(temp) < _INSULATION_TEMP_C:
+        if temp is None or float(temp) <= _INSULATION_TEMP_C:
             continue
         handle = str(el.get("handle") or el.get("id") or "")
         violations.append(_violation(
             equipment_id=handle,
             violation_type="insulation_thickness_error",
-            reason=f"유체 온도 {float(temp):.0f}℃ ≥ {_INSULATION_TEMP_C:.0f}℃ — 고온 배관 보온재 의무 적용 대상.",
+            reason=f"유체 온도 {float(temp):.0f}℃ > {_INSULATION_TEMP_C:.0f}℃ — 고온 배관 보온재 의무 적용 대상.",
             current_value=f"유체 온도 {float(temp):.0f}℃",
             required_value=f"{_INSULATION_TEMP_C:.0f}℃ 미만 또는 보온재 시공 확인",
             reference_rule="KDS 31 60 05 — 60℃ 초과 고온 배관 보온재 의무 설치",

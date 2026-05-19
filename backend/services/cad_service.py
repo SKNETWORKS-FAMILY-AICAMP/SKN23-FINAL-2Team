@@ -18,8 +18,10 @@ from typing import Any
 from backend.core.redis_client import get_redis_client
 from backend.utils.s3_manager import S3Manager
 
-# 파이썬 기본 재귀 한도를 늘려 깊은 중첩 객체(수만 개 엔티티) 처리 시 RecursionError 방지
-sys.setrecursionlimit(5000)
+# 깊은 중첩 객체 처리를 위해 재귀 한도가 부족한 경우에만 상향
+_MIN_RECURSION_LIMIT = 5000
+if sys.getrecursionlimit() < _MIN_RECURSION_LIMIT:
+    sys.setrecursionlimit(_MIN_RECURSION_LIMIT)
 
 logger = logging.getLogger(__name__)
 
@@ -292,5 +294,23 @@ class CadDataService:
             logger.warning(
                 "[CadDataService] extraction staging 삭제 실패 session=%s: %s", session_id, e
             )
+
+    async def save_snapshot_to_s3(
+        self, org_id: str, drawing_id: str, snapshot_id: str, drawing_data: dict
+    ) -> str:
+        """신규 snapshot 경로에 저장. s3_uri 반환."""
+        s3_key = (
+            f"orgs/{org_id}/drawings/{drawing_id}"
+            f"/snapshots/{snapshot_id}/entities.json"
+        )
+        await self.s3_manager.upload_json_async(s3_key, drawing_data)
+        return self.s3_manager.s3_uri_from_key(s3_key)
+
+    async def save_delta_to_s3(
+        self, org_id: str, drawing_id: str, delta_id: str, delta_data: dict
+    ) -> str:
+        s3_key = f"orgs/{org_id}/drawings/{drawing_id}/deltas/{delta_id}.json"
+        await self.s3_manager.upload_json_async(s3_key, delta_data)
+        return self.s3_manager.s3_uri_from_key(s3_key)
 
 cad_service = CadDataService()

@@ -38,6 +38,7 @@ class MappingAgent(BaseMappingAgent):
     def _get_domain_prefix_map(self) -> dict[str, str]:
         return {
             "SPK":  "스프링클러헤드",
+            "AF":   "자동화재감지기",
             "HYD":  "소화전",
             "FDH":  "화재감지기",
             "SMK":  "연기감지기",

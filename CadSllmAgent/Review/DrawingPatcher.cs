@@ -62,6 +62,12 @@ namespace CadSllmAgent.Review
         /// </summary>
         public static bool CreateEntity(AutoFix fix)
         {
+            return CreateEntity(fix, out _);
+        }
+
+        public static bool CreateEntity(AutoFix fix, out string createdHandle)
+        {
+            createdHandle = "";
             if (fix == null) return false;
 
             var doc = AcApp.DocumentManager.MdiActiveDocument;
@@ -69,7 +75,7 @@ namespace CadSllmAgent.Review
             using var tr = doc.Database.TransactionManager.StartTransaction();
             try
             {
-                bool ok = ApplyCreateEntity(doc, tr, fix);
+                bool ok = ApplyCreateEntity(doc, tr, fix, out createdHandle);
                 if (ok) tr.Commit(); else tr.Abort();
                 return ok;
             }
@@ -79,6 +85,175 @@ namespace CadSllmAgent.Review
                 tr.Abort();
                 return false;
             }
+        }
+
+        /// <summary>
+        /// fix.TargetHandles 전체를 단일 Transaction으로 같은 레이어로 변경한다.
+        /// 성공 handle과 실패 handle 목록을 반환. 기존 단일 ApplyFix() 경로는 유지된다.
+        /// </summary>
+        public static (List<string> successHandles, List<string> failedHandles) ApplyBulkLayerFix(
+            AutoFix fix, Document doc)
+        {
+            var success = new List<string>();
+            var failed  = new List<string>();
+
+            if (string.IsNullOrWhiteSpace(fix.NewLayer)
+                || fix.TargetHandles == null || fix.TargetHandles.Count == 0)
+                return (success, failed);
+
+            var distinctHandles = fix.TargetHandles
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            using var lockDoc = doc.LockDocument();
+            using var tr = doc.Database.TransactionManager.StartTransaction();
+            try
+            {
+                EnsureLayerExists(doc.Database, tr, fix.NewLayer);
+
+                foreach (var handleStr in distinctHandles)
+                {
+                    if (!TryGetObjectId(doc.Database, handleStr, out ObjectId objId))
+                    {
+                        failed.Add(handleStr);
+                        doc.Editor?.WriteMessage(
+                            $"\n[DrawingPatcher] BulkLayer: handle {handleStr} 미발견\n");
+                        continue;
+                    }
+                    try
+                    {
+                        if (tr.GetObject(objId, OpenMode.ForWrite) is Entity ent)
+                        {
+                            ent.Layer = fix.NewLayer;
+                            success.Add(handleStr);
+                        }
+                        else
+                            failed.Add(handleStr);
+                    }
+                    catch (Exception ex)
+                    {
+                        failed.Add(handleStr);
+                        doc.Editor?.WriteMessage(
+                            $"\n[DrawingPatcher] BulkLayer: {handleStr} 수정 실패: {ex.Message}\n");
+                    }
+                }
+                tr.Commit();
+                doc.Editor?.WriteMessage(
+                    $"\n[DrawingPatcher] BulkLayer 완료: 성공 {success.Count}건, 실패 {failed.Count}건\n");
+            }
+            catch (Exception ex)
+            {
+                tr.Abort();
+                doc.Editor?.WriteMessage(
+                    $"\n[DrawingPatcher] ApplyBulkLayerFix 오류: {ex.Message}\n");
+                failed = new List<string>(distinctHandles);
+                success.Clear();
+            }
+            return (success, failed);
+        }
+
+        /// <summary>
+        /// fix.TargetHandles 전체를 단일 Transaction으로 같은 수정 명령에 적용한다.
+        /// 채팅 직접 수정(CAD_ACTION)에서 다중 선택 객체를 한 번에 처리할 때 사용한다.
+        /// </summary>
+        public static (List<string> successHandles, List<string> failedHandles) ApplyBulkFix(
+            AutoFix fix, Document doc)
+        {
+            var success = new List<string>();
+            var failed  = new List<string>();
+
+            if (fix.TargetHandles == null || fix.TargetHandles.Count == 0)
+                return (success, failed);
+
+            var distinctHandles = fix.TargetHandles
+                .Where(h => !string.IsNullOrWhiteSpace(h))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            string ftype = (fix.Type ?? "").Trim().ToUpperInvariant();
+            int tier = fix.ModificationTier ?? 1;
+
+            using var lockDoc = doc.LockDocument();
+            using var tr = doc.Database.TransactionManager.StartTransaction();
+            try
+            {
+                if (ftype == "LAYER" && !string.IsNullOrWhiteSpace(fix.NewLayer))
+                    EnsureLayerExists(doc.Database, tr, fix.NewLayer);
+                if (ftype == "LINETYPE" && !string.IsNullOrWhiteSpace(fix.NewLinetype))
+                    EnsureLinetypeExists(doc.Database, tr, fix.NewLinetype);
+
+                foreach (var handleStr in distinctHandles)
+                {
+                    if (!TryGetObjectId(doc.Database, handleStr, out ObjectId objId))
+                    {
+                        failed.Add(handleStr);
+                        continue;
+                    }
+
+                    try
+                    {
+                        var openMode = ftype == "DELETE" && tier >= 4
+                            ? OpenMode.ForRead
+                            : OpenMode.ForWrite;
+                        var dbObj = tr.GetObject(objId, openMode);
+                        bool ok;
+                        if (ftype == "DELETE")
+                        {
+                            if (tier >= 4)
+                            {
+                                var proposalEntity = new AnnotatedEntity
+                                {
+                                    Handle = handleStr,
+                                    Violation = new ViolationInfo
+                                    {
+                                        Id = $"bulk-delete-{handleStr}",
+                                        ModificationTier = tier,
+                                        AutoFix = fix,
+                                    },
+                                };
+                                ok = AddProposalDeleteNote(doc, tr, objId, proposalEntity, fix);
+                            }
+                            else if (dbObj is Entity ent)
+                            {
+                                ent.Erase();
+                                ok = true;
+                            }
+                            else
+                            {
+                                ok = false;
+                            }
+                        }
+                        else
+                        {
+                            ok = ApplyByType(doc, tr, dbObj, fix);
+                        }
+
+                        if (ok)
+                            success.Add(handleStr);
+                        else
+                            failed.Add(handleStr);
+                    }
+                    catch (Exception ex)
+                    {
+                        failed.Add(handleStr);
+                        doc.Editor?.WriteMessage(
+                            $"\n[DrawingPatcher] BulkFix: {handleStr} 수정 실패: {ex.Message}\n");
+                    }
+                }
+
+                tr.Commit();
+                doc.Editor?.WriteMessage(
+                    $"\n[DrawingPatcher] BulkFix 완료: 성공 {success.Count}건, 실패 {failed.Count}건\n");
+            }
+            catch (Exception ex)
+            {
+                tr.Abort();
+                doc.Editor?.WriteMessage(
+                    $"\n[DrawingPatcher] ApplyBulkFix 오류: {ex.Message}\n");
+                failed = new List<string>(distinctHandles);
+                success.Clear();
+            }
+
+            return (success, failed);
         }
 
         /// <summary>
@@ -99,6 +274,14 @@ namespace CadSllmAgent.Review
                 var fix = entity.Violation.AutoFix;
                 int tier = ResolveModificationTier(entity);
                 string ftype = (fix.Type ?? "").Trim().ToUpperInvariant();
+                bool deleteAsProposal =
+                    ftype == "DELETE"
+                    && (
+                        (fix.ModificationTier.HasValue && fix.ModificationTier.Value >= 4)
+                        || (entity.Violation?.ModificationTier ?? 0) >= 4
+                    );
+                if (deleteAsProposal)
+                    tier = Math.Max(tier, 4);
 
                 // ✨ [수정됨] "CREATE"로 시작하는 명령은 기존 핸들이 없어도(참조용이어도) 통과시킴
                 bool isCreateCommand = ftype.StartsWith("CREATE");
@@ -118,7 +301,7 @@ namespace CadSllmAgent.Review
                     if (ok4)
                     {
                         tr.Commit();
-                        RevCloudDrawer.RemoveCloud(entity.Violation.Id);
+                        RevCloudDrawer.RemoveCloud(entity.Violation!.Id);
                     }
                     else
                         tr.Abort();
@@ -133,7 +316,7 @@ namespace CadSllmAgent.Review
                         target?.Erase();
                     }
                     tr.Commit();
-                    RevCloudDrawer.RemoveCloud(entity.Violation.Id);
+                    RevCloudDrawer.RemoveCloud(entity.Violation!.Id);
                     return true;
                 }
 
@@ -147,7 +330,7 @@ namespace CadSllmAgent.Review
                 if (ok)
                 {
                     tr.Commit();
-                    RevCloudDrawer.RemoveCloud(entity.Violation.Id);
+                    RevCloudDrawer.RemoveCloud(entity.Violation!.Id);
                 }
                 else
                 {
@@ -246,7 +429,7 @@ namespace CadSllmAgent.Review
 
             if (ft.StartsWith("CREATE"))
             {
-                return ApplyCreateEntity(doc, tr, fix);
+                return ApplyCreateEntity(doc, tr, fix, out _);
             }
 
             // 기존 객체가 null이면 아래 수정 작업들은 수행할 수 없음
@@ -276,6 +459,8 @@ namespace CadSllmAgent.Review
                     return ApplyColor(dbObj, fix);
 
                 case "LINETYPE":
+                    if (!string.IsNullOrWhiteSpace(fix.NewLinetype))
+                        EnsureLinetypeExists(doc.Database, tr, fix.NewLinetype);
                     return ApplyLinetype(dbObj, fix);
 
                 case "LINEWEIGHT":
@@ -309,8 +494,9 @@ namespace CadSllmAgent.Review
             }
         }
 
-        private static bool ApplyCreateEntity(Document doc, Transaction tr, AutoFix fix)
+        private static bool ApplyCreateEntity(Document doc, Transaction tr, AutoFix fix, out string createdHandle)
         {
+            createdHandle = "";
             // ✨ Nullable 참조 형식(?) 적용
             Entity? newEnt = null;
             string targetLayer = fix.NewLayer ?? ProposalLayerName;
@@ -329,17 +515,35 @@ namespace CadSllmAgent.Review
                     pl.Closed = true;
                     newEnt = pl;
                 }
-                // 2. 원(Circle) 생성
+                // 2. 호(Arc) 생성 — 시작/끝 각도가 지정된 경우
+                else if (fix.NewCenter != null && fix.NewRadius != null && (fix.NewStartAngle != null || fix.NewEndAngle != null))
+                {
+                    double sa = (fix.NewStartAngle ?? 0.0) * Math.PI / 180.0;
+                    double ea = (fix.NewEndAngle ?? 270.0) * Math.PI / 180.0;
+                    newEnt = new Arc(new Point3d(fix.NewCenter.X, fix.NewCenter.Y, 0), Vector3d.ZAxis, fix.NewRadius.Value, sa, ea);
+                }
+                // 3. 원(Circle) 생성
                 else if (fix.NewCenter != null && fix.NewRadius != null)
                 {
                     newEnt = new Circle(new Point3d(fix.NewCenter.X, fix.NewCenter.Y, 0), Vector3d.ZAxis, fix.NewRadius.Value);
                 }
-                // 3. 선(Line) 생성
+                // 4. 선(Line) 생성
                 else if (fix.NewStart != null && fix.NewEnd != null)
                 {
                     newEnt = new Line(new Point3d(fix.NewStart.X, fix.NewStart.Y, 0), new Point3d(fix.NewEnd.X, fix.NewEnd.Y, 0));
                 }
-                // 4. 모형(Block) 추가
+                // 5. 타원(Ellipse) 생성
+                else if (fix.NewCenter != null && fix.NewSemiMajor != null)
+                {
+                    double semiMajor = fix.NewSemiMajor.Value;
+                    double semiMinor = fix.NewSemiMinor ?? (semiMajor * 0.5);
+                    double ratio = semiMajor > 0 ? Math.Min(semiMinor / semiMajor, 1.0) : 0.5;
+                    if (ratio <= 0) ratio = 0.01;
+                    double rotRad = (fix.NewRotation ?? 0.0) * Math.PI / 180.0;
+                    var majorAxis = new Vector3d(Math.Cos(rotRad) * semiMajor, Math.Sin(rotRad) * semiMajor, 0);
+                    newEnt = new Ellipse(new Point3d(fix.NewCenter.X, fix.NewCenter.Y, 0), Vector3d.ZAxis, majorAxis, ratio, 0.0, 2 * Math.PI);
+                }
+                // 6. 텍스트(DBText) 추가
                 else if (!string.IsNullOrWhiteSpace(fix.NewText))
                 {
                     newEnt = new DBText
@@ -349,6 +553,7 @@ namespace CadSllmAgent.Review
                         Height = fix.NewHeight ?? 150.0,
                     };
                 }
+                // 7. 블록(Block) 삽입
                 else if (!string.IsNullOrWhiteSpace(fix.NewBlockName))
                 {
                     var bt = (BlockTable)tr.GetObject(doc.Database.BlockTableId, OpenMode.ForRead);
@@ -369,13 +574,18 @@ namespace CadSllmAgent.Review
                     EnsureLayerExists(doc.Database, tr, targetLayer);
                     newEnt.Layer = targetLayer;
 
+                    // 색상 지정이 있으면 적용 (new_color ACI 인덱스)
+                    if (fix.NewColor != null)
+                        ApplyColor(newEnt, fix);
+
                     BlockTable bt = (BlockTable)tr.GetObject(doc.Database.BlockTableId, OpenMode.ForRead);
                     BlockTableRecord ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
 
                     ms.AppendEntity(newEnt);
                     tr.AddNewlyCreatedDBObject(newEnt, true);
+                    createdHandle = newEnt.Handle.ToString();
 
-                    doc.Editor.WriteMessage($"\n[DrawingPatcher] 신규 객체 생성 성공 (타입: {newEnt.GetType().Name}, 레이어: {targetLayer})\n");
+                    doc.Editor.WriteMessage($"\n[DrawingPatcher] 신규 객체 생성 성공 (타입: {newEnt.GetType().Name}, 레이어: {targetLayer}, 색상: {fix.NewColor?.ToString() ?? "ByLayer"})\n");
                     return true;
                 }
 
@@ -661,6 +871,13 @@ namespace CadSllmAgent.Review
             if (fix.NewText == null) return false;
             if (obj is MText mt) { mt.Contents = fix.NewText; return true; }
             else if (obj is DBText dt) { dt.TextString = fix.NewText; return true; }
+            else if (obj is MLeader ml && ml.ContentType == ContentType.MTextContent && ml.MText != null)
+            {
+                var leaderText = ml.MText;
+                leaderText.Contents = fix.NewText;
+                ml.MText = leaderText;
+                return true;
+            }
             return false;
         }
 
@@ -669,6 +886,13 @@ namespace CadSllmAgent.Review
             if (fix.NewHeight == null) return false;
             if (obj is MText mt) { mt.TextHeight = fix.NewHeight.Value; return true; }
             else if (obj is DBText dt) { dt.Height = fix.NewHeight.Value; return true; }
+            else if (obj is MLeader ml && ml.ContentType == ContentType.MTextContent && ml.MText != null)
+            {
+                var leaderText = ml.MText;
+                leaderText.TextHeight = fix.NewHeight.Value;
+                ml.MText = leaderText;
+                return true;
+            }
             return false;
         }
 
@@ -905,6 +1129,28 @@ namespace CadSllmAgent.Review
             var layer = new LayerTableRecord { Name = layerName };
             lt.Add(layer);
             tr.AddNewlyCreatedDBObject(layer, true);
+        }
+
+        private static void EnsureLinetypeExists(Database db, Transaction tr, string linetypeName)
+        {
+            if (string.IsNullOrWhiteSpace(linetypeName)) return;
+
+            var ltt = (LinetypeTable)tr.GetObject(db.LinetypeTableId, OpenMode.ForRead);
+            if (ltt.Has(linetypeName)) return;
+
+            foreach (var fileName in new[] { "acad.lin", "acadiso.lin" })
+            {
+                try
+                {
+                    db.LoadLineTypeFile(linetypeName, fileName);
+                    ltt = (LinetypeTable)tr.GetObject(db.LinetypeTableId, OpenMode.ForRead);
+                    if (ltt.Has(linetypeName)) return;
+                }
+                catch
+                {
+                    // Fall through to the next standard linetype file. ApplyLinetype will report failure if unavailable.
+                }
+            }
         }
     }
 }

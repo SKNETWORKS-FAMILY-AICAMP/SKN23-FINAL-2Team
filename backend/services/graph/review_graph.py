@@ -52,10 +52,6 @@ def build_review_graph(node_fn: Callable = review_agent_node):
 from backend.services.graph.nodes.elec_review_node import elec_review_node
 from backend.services.graph.nodes.arch_review_node import arch_review_node
 
-def build_electric_graph():
-    """하위 호환: 전기 그래프 인스턴스(지연 생성)."""
-    return electric_review_graph
-
 electric_review_graph = build_review_graph(node_fn=elec_review_node)
 
 

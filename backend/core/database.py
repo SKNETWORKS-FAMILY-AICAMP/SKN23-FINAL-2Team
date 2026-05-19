@@ -56,7 +56,32 @@ if settings.USE_SSH_TUNNEL:
 async_db_url = db_url.replace("postgresql://", "postgresql+asyncpg://")
 
 # 3. 비동기 엔진(통로) 생성
-engine = create_async_engine(async_db_url, echo=False)
+_engine_options = {
+    "echo": False,
+    "pool_pre_ping": True,
+    "pool_recycle": 1800,
+    "pool_timeout": settings.DB_POOL_TIMEOUT,
+}
+if async_db_url.startswith("postgresql+asyncpg://"):
+    if settings.DB_POOL_SIZE is not None:
+        _engine_options.update(
+            {
+                "pool_size": max(1, int(settings.DB_POOL_SIZE)),
+                "max_overflow": max(0, int(settings.DB_MAX_OVERFLOW or 0)),
+            }
+        )
+    elif settings.USE_SSH_TUNNEL:
+        # SSH tunnels can time out when too many forwarded DB channels open at once.
+        _engine_options.update(
+            {
+                "pool_size": max(2, int(settings.SSH_DB_POOL_SIZE)),
+                "max_overflow": max(0, int(settings.SSH_DB_MAX_OVERFLOW)),
+            }
+        )
+    else:
+        _engine_options.update({"pool_size": 5, "max_overflow": 10})
+
+engine = create_async_engine(async_db_url, **_engine_options)
 
 # 4. 비동기 세션 설정
 SessionLocal = sessionmaker(

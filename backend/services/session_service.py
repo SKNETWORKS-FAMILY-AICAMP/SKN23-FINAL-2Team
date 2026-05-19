@@ -109,6 +109,7 @@ async def create_session_for_frontend(
     agent_type: str,
     dwg_filename: str = "",
     device_id: str = "",
+    org_id: str = "",
 ) -> dict:
     """프론트엔드 채팅 UI에서 호출하는 세션 생성. device_id가 있으면 기기별 격리."""
     domain_type = AGENT_TYPE_TO_DOMAIN.get(agent_type, agent_type)
@@ -124,12 +125,17 @@ async def create_session_for_frontend(
     result = await db.execute(
         text(
             """
-            INSERT INTO chat_sessions (device_id, domain_type, session_title, summary_text, recent_chat)
-            VALUES (:device_id, :domain_type, :session_title, '', '')
-            RETURNING id, device_id, domain_type, session_title, created_at
+            INSERT INTO chat_sessions (org_id, device_id, domain_type, session_title, summary_text, recent_chat)
+            VALUES (:org_id, :device_id, :domain_type, :session_title, '', '')
+            RETURNING id, org_id, device_id, domain_type, session_title, created_at
             """
         ),
-        {"device_id": safe_device_id, "domain_type": domain_type, "session_title": title},
+        {
+            "org_id": org_id.strip() if org_id else None,
+            "device_id": safe_device_id,
+            "domain_type": domain_type,
+            "session_title": title,
+        },
     )
     await db.commit()
     row = result.mappings().one()
@@ -144,10 +150,11 @@ async def create_session_for_frontend(
     }
 
 
-async def list_sessions_by_domain(
+async def _legacy_list_sessions_by_domain_unused(
     db: AsyncSession,
     domain_type: str,
     device_id: str = "",
+    org_id: str = "",
 ) -> list[dict]:
     """도메인별 세션 목록 조회 (메시지 수 포함). device_id가 있으면 해당 기기 세션만 반환."""
     # 'CAD-Agent가 준비되었습니다...' 안내 메시지만 있는 세션은 목록에서 제외하는 조건
@@ -191,6 +198,59 @@ async def list_sessions_by_domain(
             ),
             {"domain_type": domain_type},
         )
+    rows = result.mappings().all()
+    out = []
+    for row in rows:
+        created_at = row["created_at"]
+        out.append({
+            "id": str(row["id"]),
+            "agent_type": str(row["domain_type"]),
+            "title": str(row["session_title"] or "새 대화"),
+            "dwg_filename": "",
+            "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at or ""),
+            "message_count": int(row["message_count"]),
+        })
+    return out
+
+
+async def list_sessions_by_domain(
+    db: AsyncSession,
+    domain_type: str,
+    device_id: str = "",
+    org_id: str = "",
+) -> list[dict]:
+    """List sessions by org boundary, and by device/user id when provided."""
+    where = ["cs.domain_type = :domain_type"]
+    params = {"domain_type": domain_type}
+
+    if org_id:
+        where.append(
+            "(CAST(cs.org_id AS text) = :org_id OR "
+            "(cs.org_id IS NULL AND CAST(l.org_id AS text) = :org_id))"
+        )
+        params["org_id"] = org_id
+
+    if device_id:
+        where.append("CAST(cs.device_id AS text) = :device_id")
+        params["device_id"] = device_id
+
+    result = await db.execute(
+        text(
+            f"""
+            SELECT cs.id, cs.domain_type, cs.session_title, cs.created_at,
+                   COUNT(cm.id) AS message_count
+            FROM chat_sessions cs
+            LEFT JOIN devices d ON d.id = cs.device_id
+            LEFT JOIN licenses l ON l.id = d.license_id
+            LEFT JOIN chat_messages cm ON cm.session_id = cs.id
+            WHERE {' AND '.join(where)}
+            GROUP BY cs.id, cs.domain_type, cs.session_title, cs.created_at
+            HAVING COUNT(cm.id) > 0
+            ORDER BY cs.created_at DESC
+            """
+        ),
+        params,
+    )
     rows = result.mappings().all()
     out = []
     for row in rows:

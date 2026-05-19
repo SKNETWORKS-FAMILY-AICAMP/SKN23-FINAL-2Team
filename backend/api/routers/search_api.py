@@ -84,7 +84,10 @@ async def chat_with_spec(
             unique_sources = []
         else:
             context_text = "\n\n".join([c.content for c in chunks])
-            answer = await llm_service.generate_answer(query, context_text)
+            answer = await llm_service.generate_answer([
+                {"role": "system", "content": "당신은 시방서 기반 건설 규정 전문가입니다. 주어진 시방서 내용을 근거로 사용자의 질문에 정확하게 답변하세요."},
+                {"role": "user", "content": f"시방서 내용:\n{context_text}\n\n질문: {query}"},
+            ])
             unique_sources = list({c.doc_name for c in chunks if c.doc_name})
 
         ai_msg = ChatMessage(session_id=session_id, role="assistant", content=answer)

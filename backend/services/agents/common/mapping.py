@@ -343,7 +343,14 @@ def _to_name(item: Any) -> str:
     if isinstance(item, str):
         return item
     if isinstance(item, dict):
-        return str(item.get("name") or item.get("layer_name") or item.get("block_name") or "")
+        # effective_name: 동적 블록의 실제 이름(*U123 → E-LIGHT-LED). block_name보다 우선 사용.
+        return str(
+            item.get("effective_name")
+            or item.get("name")
+            or item.get("layer_name")
+            or item.get("block_name")
+            or ""
+        )
     return str(item)
 
 
@@ -488,10 +495,11 @@ class BaseMappingAgent:
 
         if not raw_blocks:
             raw_blocks = [
-                e.get("block_name") or e.get("name", "")
+                # effective_name: 동적 블록 실제 이름(*U123 → E-LIGHT-LED) 우선, 없으면 block_name 폴백
+                e.get("effective_name") or e.get("block_name") or e.get("name", "")
                 for e in data.get("entities", [])
                 if e.get("type", "").upper() not in _SKIP_ENTITY_TYPES
-                and (e.get("block_name") or e.get("name", ""))
+                and (e.get("effective_name") or e.get("block_name") or e.get("name", ""))
             ]
 
         all_names: set[str] = set()

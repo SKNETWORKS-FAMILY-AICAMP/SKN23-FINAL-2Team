@@ -27,7 +27,7 @@ import {
   ChevronDown,
 } from "lucide-react";
 import { useAgentStore } from "../../store/agentStore";
-import { getDocumentApiHeaders } from "../../utils/documentApiAuth";
+import { getDocumentApiHeaders, isAgentApiRegistered } from "../../utils/documentApiAuth";
 
 const T = {
   bg: "#1e1e1e",
@@ -49,7 +49,9 @@ const T = {
   success: "#4EC9B0",
 } as const;
 
-const API_BASE = "http://localhost:8000/api/v1/documents";
+const API_BASE =
+  ((import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "") ||
+    "http://localhost:8000") + "/api/v1/documents";
 
 const DOMAIN_OPTIONS = [
   { value: "elec", label: "전기" },
@@ -225,13 +227,58 @@ interface TempDoc {
   file_name: string;
   comment: string | null;
   status: string;
+  domain?: string | null;
   reg_date: string;
   delete_date: string;
   storage_path?: string | null;
 }
 
+interface ProjectSpecLinkPayload {
+  project_id?: string;
+  org_id?: string;
+  documents?: { temp_document_id?: string }[];
+}
+
+const PROJECT_ID_STORAGE_KEY = "skn23_current_project_id";
+
+function createProjectId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `00000000-0000-4000-8000-${Date.now().toString(16).padStart(12, "0").slice(-12)}`;
+}
+
+function getStoredProjectId(): string {
+  return localStorage.getItem(PROJECT_ID_STORAGE_KEY) || "";
+}
+
+function storeProjectId(projectId: string) {
+  if (projectId) localStorage.setItem(PROJECT_ID_STORAGE_KEY, projectId);
+}
+
+function buildUploadSuccessMessage(data: any): string {
+  const lines = [
+    `파일: ${data.filename ?? "-"}`,
+    `분석된 청크 수: ${data.chunk_count ?? 0}개`,
+  ];
+
+  if (typeof data.db_inserted_chunks === "number") {
+    lines.push(`DB 저장 청크 수: ${data.db_inserted_chunks}개`);
+  }
+
+  const stats = data.table_markdown_stats;
+  if (stats && typeof stats === "object") {
+    const tableChunks = Number(stats.table_chunks ?? 0);
+    const filled = Number(stats.table_markdown_filled ?? 0);
+    lines.push(`표 복원: ${filled}/${tableChunks}개`);
+  }
+
+  return lines.join("\n");
+}
+
 /** C# 숨김 폴더 link.json 동기화 (참조 메타만) */
 function postTempSpecLinkToHost(
+  projectId: string,
   trackedIds: string[],
   rows: TempDoc[],
   org: string,
@@ -245,7 +292,8 @@ function postTempSpecLinkToHost(
     };
   });
   const payload = {
-    version: 1,
+    version: 2,
+    project_id: projectId,
     org_id: org,
     updated_at: new Date().toISOString(),
     documents: docs,
@@ -257,6 +305,65 @@ function postTempSpecLinkToHost(
   } catch {
     /* noop */
   }
+}
+
+function postTempSpecLinkClearToHost() {
+  try {
+    window.chrome?.webview?.postMessage(
+      JSON.stringify({ action: "TEMP_SPEC_LINK_CLEAR_CURRENT" }),
+    );
+  } catch {
+    /* noop */
+  }
+}
+
+async function fetchProjectSpecLinks(projectId: string, org: string): Promise<TempDoc[]> {
+  if (!projectId || !org) return [];
+  const res = await fetch(
+    `${API_BASE}/temp/projects/${encodeURIComponent(projectId)}/specs?org_id=${encodeURIComponent(org)}`,
+    { headers: { ...getDocumentApiHeaders() } },
+  );
+  if (!res.ok) return [];
+  const data = await res.json();
+  return (data.documents || []).map((d: any) => ({
+    id: d.temp_document_id,
+    file_name: d.file_name ?? "",
+    comment: d.comment ?? null,
+    status: d.status ?? "",
+    domain: d.domain ?? null,
+    reg_date: d.reg_date ?? new Date().toISOString(),
+    delete_date: d.delete_date ?? "",
+    storage_path: d.storage_path ?? "",
+  }));
+}
+
+async function saveProjectSpecLinks(
+  projectId: string,
+  org: string,
+  ids: string[],
+): Promise<TempDoc[]> {
+  const res = await fetch(
+    `${API_BASE}/temp/projects/${encodeURIComponent(projectId)}/specs`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...getDocumentApiHeaders() },
+      body: JSON.stringify({ org_id: org, temp_document_ids: ids }),
+    },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.status !== "success") {
+    throw new Error(data.detail || "Failed to save project spec links");
+  }
+  return (data.documents || []).map((d: any) => ({
+    id: d.temp_document_id,
+    file_name: d.file_name ?? "",
+    comment: d.comment ?? null,
+    status: d.status ?? "",
+    domain: d.domain ?? null,
+    reg_date: d.reg_date ?? new Date().toISOString(),
+    delete_date: d.delete_date ?? "",
+    storage_path: d.storage_path ?? "",
+  }));
 }
 
 interface Props {
@@ -289,6 +396,9 @@ export default function SpecManagerModal({ isOpen, onClose }: Props) {
   const [isLoading, setIsLoading] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [projectId, setProjectId] = useState<string>(() => getStoredProjectId());
+  const [projectNotice, setProjectNotice] = useState("");
+  const [isApplyingProject, setIsApplyingProject] = useState(false);
 
   // 기간연장 모달 (체크 선택 후 툴바 «연장»)
   const [showExtendModal, setShowExtendModal] = useState(false);
@@ -299,6 +409,71 @@ export default function SpecManagerModal({ isOpen, onClose }: Props) {
 
   const orgId = localStorage.getItem("skn23_org_id") || "";
   const deviceId = localStorage.getItem("skn23_device_id") || "";
+
+  const ensureProjectId = () => {
+    const existing = projectId || getStoredProjectId();
+    if (existing) return existing;
+    const created = createProjectId();
+    storeProjectId(created);
+    setProjectId(created);
+    return created;
+  };
+
+  const mergeSpecRows = (rows: TempDoc[]) => {
+    if (rows.length === 0) return;
+    setSpecList((prev) => {
+      const byId = new Map(prev.map((row) => [row.id, row]));
+      for (const row of rows) byId.set(row.id, { ...byId.get(row.id), ...row });
+      return Array.from(byId.values());
+    });
+  };
+
+  const publishProjectSpecsToHost = (pid: string, ids: string[], rows: TempDoc[]) => {
+    postTempSpecLinkToHost(pid, ids, rows, orgId);
+  };
+
+  const clearProjectSpecsFromHost = () => {
+    localStorage.removeItem(PROJECT_ID_STORAGE_KEY);
+    setProjectId("");
+    postTempSpecLinkClearToHost();
+  };
+
+  const applyProjectSpecsFromRows = (rows: TempDoc[]) => {
+    const ids = rows.map((row) => row.id).filter(Boolean);
+    setSelectedTempSpecIds(ids);
+    setSelectedIds(ids);
+    mergeSpecRows(rows);
+  };
+
+  const saveSelectedSpecsToProject = async () => {
+    if (!isAgentApiRegistered() || !orgId) {
+      setProjectNotice("API 키 등록 후 프로젝트 시방서를 사용할 수 있습니다.");
+      return;
+    }
+    const pid = selectedIds.length > 0 ? ensureProjectId() : projectId || getStoredProjectId();
+    setIsApplyingProject(true);
+    setProjectNotice("");
+    try {
+      if (selectedIds.length === 0) {
+        if (pid) {
+          await saveProjectSpecLinks(pid, orgId, []);
+        }
+        setSelectedTempSpecIds([]);
+        setSelectedIds([]);
+        clearProjectSpecsFromHost();
+        setProjectNotice("?꾨줈?앺듃 ?쒕갑???곸슜???댁젣?덉뒿?덈떎.");
+        return;
+      }
+      const rows = await saveProjectSpecLinks(pid, orgId, selectedIds);
+      applyProjectSpecsFromRows(rows);
+      publishProjectSpecsToHost(pid, rows.map((row) => row.id).filter(Boolean), rows);
+      setProjectNotice(`프로젝트 시방서 ${rows.length}개를 적용했습니다.`);
+    } catch (err: any) {
+      setProjectNotice(err?.message || "프로젝트 시방서 적용에 실패했습니다.");
+    } finally {
+      setIsApplyingProject(false);
+    }
+  };
 
   // 목록 조회
   const fetchList = async () => {
@@ -317,7 +492,8 @@ export default function SpecManagerModal({ isOpen, onClose }: Props) {
       setSpecList(docs);
       const tracked = useAgentStore.getState().selectedTempSpecIds;
       if (tracked.length > 0 && window.chrome?.webview) {
-        postTempSpecLinkToHost(tracked, docs, orgId);
+        const pid = projectId || getStoredProjectId() || ensureProjectId();
+        publishProjectSpecsToHost(pid, tracked, docs);
       }
     } catch {
       setSpecList([]);
@@ -330,9 +506,90 @@ export default function SpecManagerModal({ isOpen, onClose }: Props) {
     if (activeTab === "manage") fetchList();
   }, [activeTab]);
 
+  useEffect(() => {
+    try {
+      window.chrome?.webview?.postMessage(JSON.stringify({ action: "SPEC_MODAL_READY" }));
+    } catch {
+      /* noop */
+    }
+
+    const handleHostMessage = (event: Event) => {
+      let msg: any;
+      try {
+        msg = JSON.parse((event as any).data);
+      } catch {
+        return;
+      }
+      if (msg.action === "TEMP_SPEC_LINK_CLEARED") {
+        localStorage.removeItem(PROJECT_ID_STORAGE_KEY);
+        setProjectId("");
+        setSelectedTempSpecIds([]);
+        setSelectedIds([]);
+        setProjectNotice("");
+        return;
+      }
+      if (msg.action !== "TEMP_SPEC_LINK_LOADED") return;
+
+      const payload = (msg.payload || {}) as ProjectSpecLinkPayload;
+      const payloadOrg = payload.org_id || "";
+      if (payloadOrg && orgId && payloadOrg !== orgId) return;
+
+      if (!isAgentApiRegistered() || !orgId) {
+        localStorage.removeItem(PROJECT_ID_STORAGE_KEY);
+        setProjectId("");
+        setSelectedTempSpecIds([]);
+        setSelectedIds([]);
+        setProjectNotice("API 키 등록 후 sidecar 시방서를 사용할 수 있습니다.");
+        return;
+      }
+
+      const pid = payload.project_id || getStoredProjectId();
+      if (pid) {
+        storeProjectId(pid);
+        setProjectId(pid);
+      }
+
+      const applyPayloadDocuments = () => {
+        const ids = (payload.documents || [])
+          .map((doc) => doc.temp_document_id)
+          .filter((id): id is string => !!id);
+        if (ids.length > 0) {
+          setSelectedTempSpecIds(ids);
+          setSelectedIds(ids);
+        }
+      };
+
+      if (pid) {
+        void fetchProjectSpecLinks(pid, orgId).then((rows) => {
+          if (rows.length > 0) {
+            applyProjectSpecsFromRows(rows);
+            setProjectNotice(`sidecar 프로젝트 시방서 ${rows.length}개를 불러왔습니다.`);
+            return;
+          }
+          applyPayloadDocuments();
+        });
+      } else {
+        applyPayloadDocuments();
+      }
+    };
+
+    window.chrome?.webview?.addEventListener("message", handleHostMessage);
+    return () => {
+      window.chrome?.webview?.removeEventListener("message", handleHostMessage);
+    };
+  }, [orgId]);
+
   // 업로드 핸들러 — 실제 API
   const handleUpload = async () => {
     if (files.length === 0) return;
+    if (!orgId || !deviceId) {
+      setUploadResult({
+        type: "error",
+        title: "인증 정보 확인",
+        message: "조직 또는 장치 정보가 없습니다. API 키를 다시 등록한 뒤 시방서를 업로드해 주세요.",
+      });
+      return;
+    }
     if (domain == null || retentionMonths == null) {
       setUploadResult({
         type: "error",
@@ -351,7 +608,7 @@ export default function SpecManagerModal({ isOpen, onClose }: Props) {
       form.append("org_id", orgId);
       form.append("device_id", deviceId);
       form.append("domain_type", domain);
-      form.append("category", "general");
+      form.append("category", "spec");
       form.append("comment", comment);
       form.append("retention_months", String(retentionMonths));
 
@@ -369,9 +626,10 @@ export default function SpecManagerModal({ isOpen, onClose }: Props) {
       setUploadResult({
         type: "success",
         title: "시방서 등록 완료",
-        message: `파일: ${data.filename}\n분석된 청크 수: ${data.chunk_count}개`,
+        message: buildUploadSuccessMessage(data),
       });
       if (data.document_id) {
+        const pid = ensureProjectId();
         const current = useAgentStore.getState().selectedTempSpecIds;
         const next = [...current, data.document_id];
         setSelectedTempSpecIds(next);
@@ -380,11 +638,18 @@ export default function SpecManagerModal({ isOpen, onClose }: Props) {
           file_name: data.filename ?? "",
           comment: null,
           status: "completed",
+          domain,
           reg_date: new Date().toISOString(),
           delete_date: "",
           storage_path: "",
         };
-        postTempSpecLinkToHost(next, [...specList, extraRow], orgId);
+        try {
+          await saveProjectSpecLinks(pid, orgId, next);
+          setProjectNotice("업로드한 시방서를 현재 프로젝트에 적용했습니다.");
+        } catch {
+          setProjectNotice("업로드는 완료됐지만 프로젝트 링크 저장은 실패했습니다.");
+        }
+        publishProjectSpecsToHost(pid, next, [...specList, extraRow]);
       }
       setFiles([]);
       setComment("");
@@ -408,6 +673,7 @@ export default function SpecManagerModal({ isOpen, onClose }: Props) {
     const remaining = selectedTempSpecIds.filter(
       (x) => !selectedIds.includes(x),
     );
+    const remainingRows = specList.filter((row) => remaining.includes(row.id));
     setSelectedTempSpecIds(remaining);
     for (const id of selectedIds) {
       try {
@@ -418,6 +684,20 @@ export default function SpecManagerModal({ isOpen, onClose }: Props) {
       } catch {
         /* swallow */
       }
+    }
+    const pid = projectId || getStoredProjectId();
+    if (pid && orgId) {
+      try {
+        await saveProjectSpecLinks(pid, orgId, remaining);
+      } catch {
+        /* project links also cascade when temp docs are deleted */
+      }
+    }
+    if (remaining.length > 0 && pid) {
+      publishProjectSpecsToHost(pid, remaining, remainingRows);
+    } else {
+      clearProjectSpecsFromHost();
+      setProjectNotice("");
     }
     setSelectedIds([]);
     fetchList();
@@ -861,6 +1141,34 @@ export default function SpecManagerModal({ isOpen, onClose }: Props) {
               <div style={{ flex: 1 }} />
               <button
                 type="button"
+                onClick={saveSelectedSpecsToProject}
+                disabled={isApplyingProject}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "4px",
+                  padding: "5px 12px",
+                  background:
+                    isApplyingProject
+                      ? "transparent"
+                      : "rgba(78,201,176,0.12)",
+                  color:
+                    isApplyingProject
+                      ? T.textMuted
+                      : T.success,
+                  border: `1px solid ${T.border}`,
+                  borderRadius: "3px",
+                  fontSize: "12px",
+                  cursor:
+                    isApplyingProject
+                      ? "not-allowed"
+                      : "pointer",
+                }}
+              >
+                <CheckCircle size={13} /> {selectedIds.length === 0 ? "적용 해제" : "프로젝트 적용"}
+              </button>
+              <button
+                type="button"
                 onClick={() => {
                   if (selectedIds.length === 0) return;
                   setExtendMonths(1);
@@ -910,6 +1218,22 @@ export default function SpecManagerModal({ isOpen, onClose }: Props) {
                 <Trash2 size={13} /> 삭제
               </button>
             </div>
+
+            {projectNotice && (
+              <div
+                style={{
+                  margin: "8px 12px",
+                  padding: "8px 10px",
+                  border: `1px solid ${T.border}`,
+                  borderRadius: "4px",
+                  background: T.cardBg,
+                  color: T.textSub,
+                  fontSize: "12px",
+                }}
+              >
+                {projectNotice}
+              </div>
+            )}
 
             {/* 테이블 헤더 */}
             <div

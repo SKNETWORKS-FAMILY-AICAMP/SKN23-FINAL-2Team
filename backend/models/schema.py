@@ -17,7 +17,7 @@ Modification History :
 
 import enum
 import uuid
-from sqlalchemy import Boolean, Column, DateTime, Numeric, ForeignKey, Index, Integer, String, Text, Enum, Identity, Date, text
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, Numeric, ForeignKey, Index, Integer, String, Text, Enum, Identity, Date, text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
 from sqlalchemy.sql import func
 
@@ -89,6 +89,8 @@ class Device(Base):
     is_active = Column(Boolean, default=True)
     first_seen = Column(DateTime(timezone=True), server_default=func.now())
     last_seen = Column(DateTime(timezone=True), onupdate=func.now())
+    hostname = Column(String(200), nullable=True)
+    os_user = Column(String(100), nullable=True)
     display_name = Column(Text)
 
 
@@ -200,6 +202,7 @@ class DocumentChunk(Base):
     section_id = Column(Text, nullable=True)
     chunk_type = Column(Text, nullable=True)
     search_vector = Column(TSVECTOR, nullable=True)
+    table_markdown = Column(Text, nullable=True)
     __table_args__ = (
         Index("idx_document_chunks_search_vector", "search_vector", postgresql_using="gin"),
         Index("idx_document_chunks_section_trgm", "section_id", postgresql_using="gin", postgresql_ops={"section_id": "gin_trgm_ops"}),
@@ -215,7 +218,7 @@ class DocumentChunk(Base):
 
 class TempDocument(Base):
     __tablename__ = "temp_documents"
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
+    id = Column(PGUUID, primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
     org_id = Column(PGUUID, ForeignKey("organizations.id", ondelete="CASCADE"))
     device_id = Column(PGUUID, ForeignKey("devices.id", ondelete="SET NULL"), nullable=True)
     file_name = Column(String(255))
@@ -227,24 +230,43 @@ class TempDocument(Base):
     domain = Column(String(50), nullable=True)
 
 
+class ProjectSpecLink(Base):
+    __tablename__ = "project_spec_links"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    org_id = Column(PGUUID, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
+    project_id = Column(PGUUID, nullable=False)
+    temp_document_id = Column(PGUUID, ForeignKey("temp_documents.id", ondelete="CASCADE"), nullable=False)
+    priority = Column(Integer, nullable=False, server_default=text("0"), default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("org_id", "project_id", "temp_document_id", name="uq_project_spec_links_project_temp_doc"),
+        Index("idx_project_spec_links_project", "org_id", "project_id", "priority"),
+        Index("idx_project_spec_links_temp_document", "temp_document_id"),
+    )
+
+
 class TempDocumentChunk(Base):
     __tablename__ = "temp_document_chunks"
     id = Column(Integer, Identity(always=True), primary_key=True)
-    temp_document_id = Column(String, ForeignKey("temp_documents.id", ondelete="CASCADE"))
+    temp_document_id = Column(PGUUID, ForeignKey("temp_documents.id", ondelete="CASCADE"))
     chunk_index = Column(Integer, nullable=True)
     content = Column(Text)
     dense_embedding = Column(Vector(1024))
-    domain = Column(String(50), nullable=True)
-    category = Column(String(100), nullable=True)
+    domain = Column(Text, nullable=True)
+    category = Column(Text, nullable=True)
     doc_name = Column(String(255), nullable=True)
     effective_date = Column(Date, nullable=True)
-    section_id = Column(String(50), nullable=True)
-    chunk_type = Column(String(50), nullable=True)
+    section_id = Column("session_id", Text, nullable=True)
+    chunk_type = Column(Text, nullable=True)
     org_id = Column(PGUUID, index=True)
     search_vector = Column(TSVECTOR, nullable=True)
+    table_markdown = Column(Text, nullable=True)
     __table_args__ = (
         Index("idx_temp_document_chunks_search_vector", "search_vector", postgresql_using="gin"),
-        Index("idx_temp_document_chunks_section_trgm", "section_id", postgresql_using="gin", postgresql_ops={"section_id": "gin_trgm_ops"}),
+        Index("idx_temp_document_chunks_session_trgm", section_id, postgresql_using="gin", postgresql_ops={"session_id": "gin_trgm_ops"}),
         Index(
             "ix_temp_chunks_embedding_hnsw",
             dense_embedding,

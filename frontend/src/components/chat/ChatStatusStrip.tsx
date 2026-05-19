@@ -8,6 +8,8 @@ import React, { useEffect, useMemo, useState } from "react";
 import { Bot, Database, FileSearch, Loader2, Network, Sparkles } from "lucide-react";
 import { useAgentStore } from "../../store/agentStore";
 import { C } from "../../constants/theme";
+import { DrawingStatusBadge } from "../DrawingStatusBadge";
+import cadLoadingGif from "../../assets/loading/cad_loading_transparent.gif";
 
 const CLIENT_STATUS_ROTATE_MS = 1600;
 const CLIENT_LIVE_UI_MS = 100;
@@ -87,7 +89,10 @@ function useThinkingLines(agentName: string) {
   const t0 = clientWaitStart ?? Date.now();
   const stepIdx =
     clientLines.length > 0
-      ? Math.floor((Date.now() - t0) / CLIENT_STATUS_ROTATE_MS) % clientLines.length
+      ? Math.min(
+          Math.floor((Date.now() - t0) / CLIENT_STATUS_ROTATE_MS),
+          clientLines.length - 1,
+        )
       : 0;
 
   return {
@@ -152,33 +157,51 @@ export default function ChatStatusStrip({ agentName }: { agentName: string }) {
     return () => clearInterval(id);
   }, [!!thinking]);
 
-  if (!thinking) return null;
+  if (!thinking) {
+    return (
+      <div className="flex w-full items-center justify-end px-4 py-1">
+        <DrawingStatusBadge />
+      </div>
+    );
+  }
 
   return (
     <div className="flex w-full flex-col px-4 mt-4 mb-6">
       {/* Accordion Header */}
-      <button 
-        onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-2 text-zinc-400 hover:text-zinc-300 transition-colors w-fit group"
-      >
-        <span className="text-[10px] font-semibold">
-          Thinking for {elapsed}s
-        </span>
-        <svg 
-          className={`w-4 h-4 transition-transform duration-200 ${expanded ? "rotate-180" : ""}`} 
-          fill="none" viewBox="0 0 24 24" stroke="currentColor"
+      <div className="flex items-center justify-between">
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className="flex items-center gap-2 text-zinc-400 hover:text-zinc-300 transition-colors w-fit group"
         >
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-        </svg>
-      </button>
+          <span className="text-[10px] font-semibold">
+            Thinking for {elapsed}s
+          </span>
+          <svg
+            className={`w-4 h-4 transition-transform duration-200 ${expanded ? "rotate-180" : ""}`}
+            fill="none" viewBox="0 0 24 24" stroke="currentColor"
+          >
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+          </svg>
+        </button>
+        <DrawingStatusBadge />
+      </div>
+
+      {/* CAD Loading GIF */}
+      <div className="mt-3 mb-1">
+        <img
+          src={cadLoadingGif}
+          alt="loading"
+          className="h-20 w-auto"
+        />
+      </div>
 
       {/* Logs container */}
       {expanded && (
         <div className="mt-2 pl-3 border-l border-zinc-700/50 py-0.5">
           <div className="flex flex-col gap-1 text-[11px] leading-relaxed text-zinc-500">
             {thinking.lines.map((text, i) => (
-              <div 
-                key={`${text}-${i}`} 
+              <div
+                key={`${text}-${i}`}
                 className="animate-in fade-in slide-in-from-top-1"
               >
                 {text}

@@ -150,13 +150,13 @@ class LayerBasedScoringEngine:
         score = base_score + layer_bonus
         reasons: list[str] = [f"same_layer:{layer_bonus:.0f}"]
 
-        # [L-layer 내 MEP 후보 감지]
+        # [혼합 레이어 내 MEP 후보 감지]
         text_mep_score = text_entity.get("entity_mep_score", 0.0)
         block_mep_score = block_entity.get("entity_mep_score", 0.0)
         if text_mep_score >= 0.6 or block_mep_score >= 0.6:
-            l_layer_bonus = 30.0
-            score += l_layer_bonus
-            reasons.append(f"l_layer_mep_candidate:text={text_mep_score:.2f},block={block_mep_score:.2f}:{l_layer_bonus:.0f}")
+            mixed_layer_bonus = 30.0
+            score += mixed_layer_bonus
+            reasons.append(f"mixed_layer_mep_candidate:text={text_mep_score:.2f},block={block_mep_score:.2f}:{mixed_layer_bonus:.0f}")
 
         characteristics = layer_info.get("characteristics") or {}
 

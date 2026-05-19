@@ -21,7 +21,7 @@ Description : 도면 내 다중 CAD 객체 간 최적 매핑을 결정하는 공
               # 1. 점수 계산 (레이어 보너스는 도메인별로 다르게 설정)
               score = calculate_mapping_score(
                   text_entity, block_entity,
-                  layer_bonus_config={"block_layer": "L4", "text_layer": "TEX", "bonus": 20.0},
+                  layer_bonus_config={"block_layer": "PIPE-BLOCK", "text_layer": "PIPE-TEXT", "bonus": 20.0},
               )
 
               # 2. 최적 매핑 자동 선택
@@ -413,3 +413,43 @@ async def auto_map_entities(
         len(auto_results), len(llm_results), spatial_threshold_mm,
     )
     return auto_results + llm_results
+
+
+def summarize_mapping_results(
+    text_entities: list[dict[str, Any]],
+    block_entities: list[dict[str, Any]],
+    mappings: list[dict[str, Any]],
+    *,
+    max_samples: int = 20,
+) -> dict[str, Any]:
+    text_lookup = {str(e.get("handle") or ""): e for e in text_entities}
+    block_lookup = {str(e.get("handle") or ""): e for e in block_entities}
+    method_counts: dict[str, int] = {}
+    samples: list[dict[str, Any]] = []
+
+    for mapping in mappings:
+        method = str(mapping.get("method") or "unknown")
+        method_counts[method] = method_counts.get(method, 0) + 1
+        if len(samples) >= max_samples:
+            continue
+        text_handle = str(mapping.get("text_handle") or "")
+        block_handle = str(mapping.get("block_handle") or "")
+        text = text_lookup.get(text_handle, {})
+        block = block_lookup.get(block_handle, {})
+        samples.append({
+            "text_handle": text_handle,
+            "block_handle": block_handle,
+            "label": str(mapping.get("label") or text.get("text") or text.get("content") or ""),
+            "score": mapping.get("score"),
+            "method": method,
+            "block_name": str(block.get("effective_name") or block.get("block_name") or ""),
+        })
+
+    return {
+        "text_count": len(text_entities),
+        "block_count": len(block_entities),
+        "mapping_count": len(mappings),
+        "method_counts": method_counts,
+        "unmapped_text_count": max(0, len(text_entities) - len({m.get("text_handle") for m in mappings})),
+        "samples": samples,
+    }

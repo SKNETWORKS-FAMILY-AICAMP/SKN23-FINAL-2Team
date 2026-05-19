@@ -10,9 +10,11 @@ Modification History :
 import asyncio
 import datetime
 import logging
+from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, Query
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps.license_auth import get_authenticated_org_id, require_same_org
@@ -24,6 +26,11 @@ from backend.utils.s3_manager import S3Manager
 router = APIRouter()
 s3_manager = S3Manager()
 logger = logging.getLogger(__name__)
+
+
+class ProjectSpecLinksRequest(BaseModel):
+    org_id: str
+    temp_document_ids: list[str] = Field(default_factory=list)
 
 
 def _runpod_worker_error_message(result: dict) -> str | None:
@@ -44,12 +51,95 @@ def _runpod_worker_error_message(result: dict) -> str | None:
     return None
 
 
+def _runpod_completed_output_error_message(output: dict) -> str | None:
+    """RunPod outer status=COMPLETED여도 worker 내부 실패/무청크 결과면 사유 반환."""
+    if not isinstance(output, dict):
+        return "RunPod 워커 output이 올바른 dict 형식이 아닙니다."
+
+    worker_status = str(output.get("status") or "").strip().lower()
+    if worker_status and worker_status != "success":
+        return _runpod_worker_error_message({"output": output}) or f"RunPod 워커 status={worker_status}"
+
+    processed_chunks = output.get("processed_chunks")
+    if processed_chunks is None:
+        return "RunPod 워커 output에 processed_chunks가 없습니다."
+    try:
+        if int(processed_chunks) <= 0:
+            return f"RunPod 워커가 청크를 생성하지 않았습니다. processed_chunks={processed_chunks}"
+    except (TypeError, ValueError):
+        return f"RunPod 워커 output의 processed_chunks가 숫자가 아닙니다: {processed_chunks}"
+
+    inserted_chunks = output.get("db_inserted_chunks")
+    if inserted_chunks is not None:
+        try:
+            if int(inserted_chunks) <= 0:
+                return f"RunPod 워커가 DB에 청크를 저장하지 않았습니다. db_inserted_chunks={inserted_chunks}"
+        except (TypeError, ValueError):
+            return f"RunPod 워커 output의 db_inserted_chunks가 숫자가 아닙니다: {inserted_chunks}"
+
+    return None
+
+
+async def _fetch_runpod_job_status(ep: str, rk: str, job_id: str) -> dict:
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.get(
+            f"https://api.runpod.ai/v2/{ep}/status/{job_id}",
+            headers={"Authorization": f"Bearer {rk}"},
+        )
+    if response.status_code != 200:
+        return {
+            "id": job_id,
+            "status": "FAILED",
+            "error": f"RunPod status HTTP {response.status_code}: {(response.text or '')[:500]}",
+        }
+    return response.json()
+
+
+async def _wait_for_runpod_completion(
+    ep: str,
+    rk: str,
+    initial_result: dict,
+    *,
+    poll_interval: float = 2.0,
+    timeout_seconds: float = 900.0,
+    status_getter=None,
+) -> dict:
+    result = initial_result
+    job_id = str(result.get("id") or "")
+    waiting_statuses = {"IN_QUEUE", "IN_PROGRESS", "RUNNING", "RETRYING"}
+
+    if not job_id:
+        return result
+
+    if status_getter is None:
+        async def status_getter(job_id: str) -> dict:
+            return await _fetch_runpod_job_status(ep, rk, job_id)
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+
+    while str(result.get("status") or "").upper() in waiting_statuses:
+        if loop.time() >= deadline:
+            return {
+                **result,
+                "status": "TIMED_OUT",
+                "error": (
+                    "RunPod job did not complete before backend timeout. "
+                    f"last_status={result.get('status')}"
+                ),
+            }
+        await asyncio.sleep(poll_interval)
+        result = await status_getter(job_id)
+
+    return result
+
+
 @router.post("/upload/temp")
 async def upload_temp_document(
     org_id: str = Form(...),
     device_id: str = Form(...),
     domain_type: str = Form(...),
-    category: str = Form("general"),
+    category: str = Form("spec"),
     comment: str | None = Form(None),
     retention_months: int = Form(1),
     file: UploadFile = File(...),
@@ -79,6 +169,7 @@ async def upload_temp_document(
             storage_url=storage_url,
             comment=comment,
             retention_months=retention_months,
+            domain=domain_type,
         )
 
         presigned_url = s3_manager.generate_presigned_url(s3_key, expiration=600)
@@ -109,6 +200,7 @@ async def upload_temp_document(
                                 "domain": domain_type,
                                 "category": category,
                                 "org_id": org_id,
+                                "device_id": device_id,
                                 "temp_document_id": str(doc_id),
                             }
                         },
@@ -143,20 +235,30 @@ async def upload_temp_document(
                     await document_service.update_document_status(db, doc_id, "error")
                     raise HTTPException(status_code=500, detail=f"RunPod API 통신 실패: {exc}")
 
-            result = response.json()
-            if result.get("status") != "COMPLETED":
-                await document_service.update_document_status(db, doc_id, "error")
-                reason = _runpod_worker_error_message(result)
-                logger.error("RunPod 워커 비정상 종료 status=%s body=%s", result.get("status"), result)
-                detail = (
-                    f"RunPod 워커 실패: {reason}"
-                    if reason
-                    else "RunPod 워커가 COMPLETED가 아닙니다. 엔드포인트 로그·GPU 워커 코드·입력 URL(S3 presigned)을 확인하세요."
-                )
-                raise HTTPException(status_code=500, detail=detail)
+        # RunPod 응답 검증 (for 루프 밖 — 정상 응답 경로)
+        result = await _wait_for_runpod_completion(ep, rk, response.json())
+        if result.get("status") != "COMPLETED":
+            await document_service.update_document_status(db, doc_id, "error")
+            reason = _runpod_worker_error_message(result)
+            logger.error("RunPod 워커 비정상 종료 status=%s body=%s", result.get("status"), result)
+            detail = (
+                f"RunPod 워커 실패: {reason}"
+                if reason
+                else "RunPod 워커가 COMPLETED가 아닙니다. 엔드포인트 로그·GPU 워커 코드·입력 URL(S3 presigned)을 확인하세요."
+            )
+            raise HTTPException(status_code=500, detail=detail)
 
-            worker_output = result.get("output", {})
-            chunk_count = worker_output.get("processed_chunks", 0)
+        worker_output = result.get("output", {})
+        output_error = _runpod_completed_output_error_message(worker_output)
+        if output_error:
+            await document_service.update_document_status(db, doc_id, "error")
+            logger.error("RunPod 워커 완료 후 유효 청크 없음: %s output=%s", output_error, worker_output)
+            raise HTTPException(
+                status_code=500,
+                detail=f"RunPod 워커 실패: {output_error}",
+            )
+
+        chunk_count = worker_output.get("processed_chunks", 0)
 
         await document_service.backfill_chunks_org_id(db, str(doc_id), org_id)
         await document_service.update_document_status(db, doc_id, "completed")
@@ -166,6 +268,8 @@ async def upload_temp_document(
             "document_id": str(doc_id),
             "filename": safe_filename,
             "chunk_count": chunk_count,
+            "db_inserted_chunks": worker_output.get("db_inserted_chunks"),
+            "table_markdown_stats": worker_output.get("table_markdown_stats"),
         }
 
     except HTTPException:
@@ -187,6 +291,52 @@ async def list_temp_documents(
     require_same_org(org_id, auth_org_id)
     rows = await document_service.get_temp_documents_list(db, org_id)
     return {"status": "success", "documents": rows}
+
+
+@router.get("/temp/projects/{project_id}/specs")
+async def get_project_temp_specs(
+    project_id: UUID,
+    org_id: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    auth_org_id: str = Depends(get_authenticated_org_id),
+):
+    require_same_org(org_id, auth_org_id)
+    project_id_s = str(project_id)
+    rows = await document_service.get_project_spec_links(db, org_id, project_id_s)
+    return {
+        "status": "success",
+        "org_id": org_id,
+        "project_id": project_id_s,
+        "documents": rows,
+    }
+
+
+@router.put("/temp/projects/{project_id}/specs")
+async def replace_project_temp_specs(
+    project_id: UUID,
+    body: ProjectSpecLinksRequest,
+    db: AsyncSession = Depends(get_db),
+    auth_org_id: str = Depends(get_authenticated_org_id),
+):
+    require_same_org(body.org_id, auth_org_id)
+    project_id_s = str(project_id)
+    try:
+        await document_service.replace_project_spec_links(
+            db,
+            org_id=body.org_id,
+            project_id=project_id_s,
+            temp_document_ids=body.temp_document_ids,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    rows = await document_service.get_project_spec_links(db, body.org_id, project_id_s)
+    return {
+        "status": "success",
+        "org_id": body.org_id,
+        "project_id": project_id_s,
+        "documents": rows,
+    }
 
 
 @router.get("/temp/{doc_id}/chunks")

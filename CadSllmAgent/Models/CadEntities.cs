@@ -131,12 +131,18 @@ namespace CadSllmAgent.Models
         [JsonPropertyName("area")]        public double?                     Area        { get; set; }
 
         // ── BLOCK ────────────────────────────────────────────────────
-        [JsonPropertyName("block_name")]  public string?                     BlockName   { get; set; }
-        [JsonPropertyName("insert_point")]public CadPoint?                   InsertPoint { get; set; }
-        [JsonPropertyName("rotation")]    public double?                     Rotation    { get; set; }
-        [JsonPropertyName("scale_x")]     public double?                     ScaleX      { get; set; }
-        [JsonPropertyName("scale_y")]     public double?                     ScaleY      { get; set; }
-        [JsonPropertyName("attributes")]  public Dictionary<string, string>? Attributes  { get; set; }
+        [JsonPropertyName("block_name")]     public string?                     BlockName     { get; set; }
+        /// <summary>
+        /// 동적 블록(Dynamic Block)의 실제 이름.
+        /// bref.Name이 *U123 같은 익명 이름일 때 원본 블록 정의명(예: E-LIGHT-LED)을 반환.
+        /// Python MappingAgent에서 blockName 대신 이 값을 우선 사용하여 설비 의미 분류.
+        /// </summary>
+        [JsonPropertyName("effective_name")] public string?                     EffectiveName { get; set; }
+        [JsonPropertyName("insert_point")]   public CadPoint?                   InsertPoint   { get; set; }
+        [JsonPropertyName("rotation")]       public double?                     Rotation      { get; set; }
+        [JsonPropertyName("scale_x")]        public double?                     ScaleX        { get; set; }
+        [JsonPropertyName("scale_y")]        public double?                     ScaleY        { get; set; }
+        [JsonPropertyName("attributes")]     public Dictionary<string, string>? Attributes    { get; set; }
 
         // ── MTEXT / TEXT ─────────────────────────────────────────────
         [JsonPropertyName("text")]             public string?   Text            { get; set; }

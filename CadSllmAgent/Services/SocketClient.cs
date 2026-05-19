@@ -84,11 +84,22 @@ namespace CadSllmAgent.Services
             await ConnectInternalAsync();
         }
 
+        private static void SafeWriteMessage(string message)
+        {
+            SafeTaskDispatcher.EnqueueSafeTask(() =>
+            {
+                try
+                {
+                    AcApp.DocumentManager.MdiActiveDocument?.Editor?.WriteMessage(message);
+                }
+                catch { }
+            });
+        }
+
         private static async Task ConnectInternalAsync()
         {
             while (!_stopped)
             {
-                var ed = AcApp.DocumentManager.MdiActiveDocument?.Editor;
                 try
                 {
                     // 기존 소켓 정리
@@ -99,22 +110,22 @@ namespace CadSllmAgent.Services
 
                     _retryDelay = _retryDelayMin; // 성공 시 딜레이 초기화
                     CadDebugLog.Info($"WebSocket connected: {_wsUri}");
-                    ed?.WriteMessage("\n[CAD-Agent] Python AI 서버에 연결되었습니다.\n");
+                    SafeWriteMessage("\n[CAD-Agent] Python AI 서버에 연결되었습니다.\n");
                     await FlushPendingAsync();
 
                     // 연결 유지 — 끊길 때까지 블로킹
-                    await ReceiveLoopAsync(ed);
+                    await ReceiveLoopAsync();
                 }
                 catch (Exception ex)
                 {
                     CadDebugLog.Exception("SocketClient.ConnectInternalAsync", ex);
-                    ed?.WriteMessage($"\n[CAD-Agent] 서버 연결 실패: {ex.Message}\n");
+                    SafeWriteMessage($"\n[CAD-Agent] 서버 연결 실패: {ex.Message}\n");
                 }
 
                 if (_stopped) break;
 
                 // 지수 백오프로 재연결 대기
-                ed?.WriteMessage($"\n[CAD-Agent] {_retryDelay / 1000}초 후 재연결 시도...\n");
+                SafeWriteMessage($"\n[CAD-Agent] {_retryDelay / 1000}초 후 재연결 시도...\n");
                 try
                 {
                     await Task.Delay(_retryDelay, _retryCts.Token);
@@ -128,7 +139,7 @@ namespace CadSllmAgent.Services
             }
         }
 
-        private static async Task ReceiveLoopAsync(Autodesk.AutoCAD.EditorInput.Editor? ed)
+        private static async Task ReceiveLoopAsync()
         {
             var frameBuffer = new byte[1024 * 64]; // 64KB 프레임 버퍼
             var msgStream   = new System.IO.MemoryStream();
@@ -156,7 +167,7 @@ namespace CadSllmAgent.Services
                                 WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
                         }
                         catch { /* 무시 */ }
-                        ed?.WriteMessage("\n[CAD-Agent] 서버와 연결이 종료되었습니다.\n");
+                        SafeWriteMessage("\n[CAD-Agent] 서버와 연결이 종료되었습니다.\n");
                         return; // 상위 루프에서 재연결
                     }
 
@@ -166,7 +177,7 @@ namespace CadSllmAgent.Services
                 catch (Exception ex) when (!_stopped)
                 {
                     CadDebugLog.Exception("SocketClient.ReceiveLoopAsync", ex);
-                    ed?.WriteMessage($"\n[CAD-Agent] WebSocket 수신 오류: {ex.Message}\n");
+                    SafeWriteMessage($"\n[CAD-Agent] WebSocket 수신 오류: {ex.Message}\n");
                     return; // 상위 루프에서 재연결
                 }
             }

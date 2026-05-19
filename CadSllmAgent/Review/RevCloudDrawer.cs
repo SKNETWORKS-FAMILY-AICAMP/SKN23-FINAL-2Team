@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using System.Text.Json;
 using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.Colors;
 using Autodesk.AutoCAD.DatabaseServices;
@@ -21,12 +22,14 @@ namespace CadSllmAgent.Review
         public const string ReviewLayer    = "AI_REVIEW";
         public const string ReviewLayerLow = "AI_REVIEW_LOW";   // confidence < 0.7
         private const string XDataApp = "CADSLLM";
+        private const double CloudBulge = 0.5;
+        private const double CloudMergeTolerance = 5.0;
 
         private static readonly Dictionary<string, short> SeverityColor = new()
         {
-            ["Critical"] = 1,
-            ["Major"] = 30,
-            ["Minor"] = 50,
+            ["Critical"] = 6,   // 자홍(Magenta) — 상위반
+            ["Major"]    = 200, // 보라(Purple)  — 중위반
+            ["Minor"]    = 130, // 회청색(Steel Blue) — 경미위반
         };
 
         public static void DrawAll(List<AnnotatedEntity> entities)
@@ -93,10 +96,13 @@ namespace CadSllmAgent.Review
                 int n = valid.Count;
                 if (n > 0)
                 {
+                    var mergeBounds = valid
+                        .Select(e => InflateForCloud(GetCloudBaseBounds(e)))
+                        .ToList();
                     var uf = new IntUnionFind(n);
                     for (int i = 0; i < n; i++)
                         for (int j = i + 1; j < n; j++)
-                            if (BboxesOverlap(valid[i].BBox!, valid[j].BBox!))
+                            if (BboxesOverlap(mergeBounds[i], mergeBounds[j], CloudMergeTolerance))
                                 uf.Union(i, j);
 
                     var buckets = new Dictionary<int, List<int>>();
@@ -115,11 +121,11 @@ namespace CadSllmAgent.Review
                 }
 
                 tr.Commit();
-                doc.Editor.WriteMessage($"\n[RevCloud] 위반 항목 표시 완료 (AI_REVIEW 레이어)\n");
+                doc.Editor?.WriteMessage($"\n[RevCloud] 위반 항목 표시 완료 (AI_REVIEW 레이어)\n");
             }
             catch (System.Exception ex)
             {
-                doc.Editor.WriteMessage($"\n[RevCloud 오류] {ex.Message}\n{ex.StackTrace}\n");
+                doc.Editor?.WriteMessage($"\n[RevCloud 오류] {ex.Message}\n{ex.StackTrace}\n");
                 System.Windows.Forms.MessageBox.Show(
                     $"RevCloud 오류:\n{ex.Message}\n\n{ex.StackTrace}",
                     "CAD-Agent Error", System.Windows.Forms.MessageBoxButtons.OK,
@@ -142,7 +148,8 @@ namespace CadSllmAgent.Review
             foreach (ObjectId id in btr)
             {
                 var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
-                if (ent == null || ent.Layer != ReviewLayer) continue;
+                if (ent == null) continue;
+                if (ent.Layer != ReviewLayer && ent.Layer != ReviewLayerLow) continue;
 
                 var xd = ent.GetXDataForApplication(XDataApp);
                 if (xd == null) continue;
@@ -178,7 +185,7 @@ namespace CadSllmAgent.Review
                 foreach (ObjectId id in btr)
                 {
                     var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
-                    if (ent == null || ent.Layer != ReviewLayer) continue;
+                    if (ent == null || (ent.Layer != ReviewLayer && ent.Layer != ReviewLayerLow)) continue;
                     if (ent.GetXDataForApplication(XDataApp) == null) continue;
                     toErase.Add(id);
                 }
@@ -194,19 +201,23 @@ namespace CadSllmAgent.Review
             }
         }
 
-        private static bool BboxesOverlap(BoundingBox a, BoundingBox b) =>
-            a.X1 < b.X2 && a.X2 > b.X1 && a.Y1 < b.Y2 && a.Y2 > b.Y1;
+        private static bool BboxesOverlap(BoundingBox a, BoundingBox b, double tolerance = 0.0) =>
+            a.X1 <= b.X2 + tolerance &&
+            a.X2 + tolerance >= b.X1 &&
+            a.Y1 <= b.Y2 + tolerance &&
+            a.Y2 + tolerance >= b.Y1;
 
         private static void DrawCluster(Transaction tr, Database db, List<AnnotatedEntity> cluster)
         {
-            double minX = cluster.Min(e => e.BBox!.X1);
-            double minY = cluster.Min(e => e.BBox!.Y1);
-            double maxX = cluster.Max(e => e.BBox!.X2);
-            double maxY = cluster.Max(e => e.BBox!.Y2);
+            var baseBounds = cluster.Select(GetCloudBaseBounds).ToList();
+            double minX = baseBounds.Min(b => b.X1);
+            double minY = baseBounds.Min(b => b.Y1);
+            double maxX = baseBounds.Max(b => b.X2);
+            double maxY = baseBounds.Max(b => b.Y2);
 
-            short colorIdx = 50;
-            if (cluster.Any(e => e.Violation?.Severity == "Critical")) colorIdx = 1;
-            else if (cluster.Any(e => e.Violation?.Severity == "Major")) colorIdx = 30;
+            short colorIdx = 130; // 경미(Minor) 기본 — 회청색
+            if (cluster.Any(e => e.Violation?.Severity == "Critical")) colorIdx = 6;   // 자홍
+            else if (cluster.Any(e => e.Violation?.Severity == "Major")) colorIdx = 200; // 보라
 
             double margin = Math.Max((maxX - minX + maxY - minY) * 0.08, 10.0);
             double x1 = minX - margin, y1 = minY - margin;
@@ -222,11 +233,13 @@ namespace CadSllmAgent.Review
                 e.Violation.ConfidenceScore.Value < 0.7);
             string targetLayer = isLowConf ? ReviewLayerLow : ReviewLayer;
 
-            var cloud = BuildCloudPolyline(x1, y1, x2, y2);
+            Polyline cloud;
+            if (!TryBuildSpecialCloud(tr, db, cluster, out cloud))
+                cloud = BuildCloudPolyline(x1, y1, x2, y2);
             cloud.Layer = targetLayer;
             cloud.Color = Autodesk.AutoCAD.Colors.Color.FromColorIndex(ColorMethod.ByAci, colorIdx);
-            if (isLowConf)
-                cloud.Linetype = "DASHED";  // ACAD 기본 DASHED 선종류 (없으면 BYLAYER)
+            if (isLowConf && EnsureLinetype(db, tr, "DASHED"))
+                cloud.Linetype = "DASHED";  // ACAD 기본 DASHED 선종류 (없으면 BYLAYER 유지)
             btr.AppendEntity(cloud);
             tr.AddNewlyCreatedDBObject(cloud, true);
 
@@ -250,12 +263,287 @@ namespace CadSllmAgent.Review
             // mtext.XData  = MakeXData(ids);
         }
 
+        private static BoundingBox GetCloudBaseBounds(AnnotatedEntity entity)
+        {
+            var box = NormalizeBox(entity.BBox!);
+            var violation = entity.Violation;
+            if (violation == null) return box;
+
+            foreach (var key in new[]
+            {
+                "cloud_from", "cloud_to",
+                "new_start", "new_end",
+                "touch_point", "overshoot_end",
+                "anchor_position"
+            })
+            {
+                if (TryGetActionPoint(violation, key, out var p))
+                    box = IncludePoint(box, p);
+            }
+            return box;
+        }
+
+        private static BoundingBox NormalizeBox(BoundingBox box)
+        {
+            return new BoundingBox
+            {
+                X1 = Math.Min(box.X1, box.X2),
+                Y1 = Math.Min(box.Y1, box.Y2),
+                X2 = Math.Max(box.X1, box.X2),
+                Y2 = Math.Max(box.Y1, box.Y2),
+            };
+        }
+
+        private static BoundingBox IncludePoint(BoundingBox box, Point2d p)
+        {
+            return new BoundingBox
+            {
+                X1 = Math.Min(box.X1, p.X),
+                Y1 = Math.Min(box.Y1, p.Y),
+                X2 = Math.Max(box.X2, p.X),
+                Y2 = Math.Max(box.Y2, p.Y),
+            };
+        }
+
+        private static BoundingBox InflateForCloud(BoundingBox box)
+        {
+            double w = Math.Max(0.0, box.X2 - box.X1);
+            double h = Math.Max(0.0, box.Y2 - box.Y1);
+            double margin = Math.Max((w + h) * 0.08, 10.0);
+            return new BoundingBox
+            {
+                X1 = box.X1 - margin,
+                Y1 = box.Y1 - margin,
+                X2 = box.X2 + margin,
+                Y2 = box.Y2 + margin,
+            };
+        }
+
+        private static bool TryBuildSpecialCloud(Transaction tr, Database db, List<AnnotatedEntity> cluster, out Polyline cloud)
+        {
+            cloud = null!;
+            if (cluster.Count != 1) return false;
+
+            var entity = cluster[0];
+            var violation = entity.Violation;
+            if (violation == null) return false;
+
+            if (!TryGetActionString(violation, "cloud_shape", out var shape) ||
+                string.IsNullOrWhiteSpace(shape))
+                return false;
+
+            if (string.Equals(shape, "SEGMENT", StringComparison.OrdinalIgnoreCase) &&
+                (string.Equals(violation.Type, "drawing_quality_pipe_gap", StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(violation.Type, "drawing_quality_connection_mismatch", StringComparison.OrdinalIgnoreCase)))
+            {
+                Point2d a = default;
+                Point2d b = default;
+                bool hasCloudPoints =
+                    TryGetActionPoint(violation, "cloud_from", out a) &&
+                    TryGetActionPoint(violation, "cloud_to", out b);
+                if (!hasCloudPoints)
+                {
+                    bool hasFixPoints =
+                        TryGetActionPoint(violation, "new_start", out a) &&
+                        TryGetActionPoint(violation, "new_end", out b);
+                    if (!hasFixPoints)
+                        return false;
+                }
+                if (a.GetDistanceTo(b) <= 1e-6)
+                    return false;
+                cloud = BuildSegmentCloudPolyline(a, b);
+                return true;
+            }
+
+            if (!string.Equals(violation.Type, "drawing_quality_connection_overshoot", StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(shape, "L", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (!TryGetActionPoint(violation, "touch_point", out var touch) ||
+                !TryGetActionPoint(violation, "overshoot_end", out var overshootEnd))
+                return false;
+
+            if (!TryGetActionString(violation, "connection_handle", out var connectionHandle) ||
+                !TryGetLineEndpoints(tr, db, connectionHandle, out var connA, out var connB))
+                return false;
+
+            double overshootLen = touch.GetDistanceTo(overshootEnd);
+            if (overshootLen <= 1e-6) return false;
+
+            double distA = touch.GetDistanceTo(connA);
+            double distB = touch.GetDistanceTo(connB);
+            var far = distA >= distB ? connA : connB;
+            double available = Math.Max(distA, distB);
+            if (available <= 1e-6) return false;
+
+            double branchLen = Math.Min(available, Math.Clamp(overshootLen * 1.5, 100.0, 600.0));
+            var branchDir = touch.GetVectorTo(far).GetNormal();
+            var branchEnd = Offset(touch, branchDir, branchLen);
+
+            cloud = BuildLCloudPolyline(overshootEnd, touch, branchEnd);
+            return true;
+        }
+
+        private static bool TryGetActionString(ViolationInfo violation, string key, out string value)
+        {
+            value = "";
+            if (violation.ProposedAction == null ||
+                !violation.ProposedAction.TryGetValue(key, out JsonElement el))
+                return false;
+            if (el.ValueKind != JsonValueKind.String) return false;
+            value = el.GetString() ?? "";
+            return !string.IsNullOrWhiteSpace(value);
+        }
+
+        private static bool TryGetActionPoint(ViolationInfo violation, string key, out Point2d point)
+        {
+            point = default;
+            if (violation.ProposedAction == null ||
+                !violation.ProposedAction.TryGetValue(key, out JsonElement el) ||
+                el.ValueKind != JsonValueKind.Object)
+                return false;
+            if (!el.TryGetProperty("x", out JsonElement xEl) ||
+                !el.TryGetProperty("y", out JsonElement yEl) ||
+                !xEl.TryGetDouble(out double x) ||
+                !yEl.TryGetDouble(out double y))
+                return false;
+            point = new Point2d(x, y);
+            return true;
+        }
+
+        private static bool TryGetLineEndpoints(Transaction tr, Database db, string handleStr, out Point2d a, out Point2d b)
+        {
+            a = default;
+            b = default;
+            try
+            {
+                long handleVal = Convert.ToInt64(handleStr, 16);
+                var objId = db.GetObjectId(false, new Handle(handleVal), 0);
+                if (objId == ObjectId.Null) return false;
+                var ent = tr.GetObject(objId, OpenMode.ForRead) as Entity;
+                if (ent is Line line)
+                {
+                    a = new Point2d(line.StartPoint.X, line.StartPoint.Y);
+                    b = new Point2d(line.EndPoint.X, line.EndPoint.Y);
+                    return true;
+                }
+                if (ent is Polyline pl && pl.NumberOfVertices >= 2)
+                {
+                    a = pl.GetPoint2dAt(0);
+                    b = pl.GetPoint2dAt(pl.NumberOfVertices - 1);
+                    return true;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+            return false;
+        }
+
+        internal static Polyline BuildLCloudPolyline(Point2d legEnd, Point2d corner, Point2d branchEnd)
+        {
+            double legLen = legEnd.GetDistanceTo(corner);
+            double branchLen = corner.GetDistanceTo(branchEnd);
+            if (legLen <= 1e-6 || branchLen <= 1e-6)
+                return BuildCloudAroundPoints(new[] { legEnd, corner, branchEnd });
+
+            var d1 = corner.GetVectorTo(legEnd).GetNormal();
+            var d2 = corner.GetVectorTo(branchEnd).GetNormal();
+            if (Math.Abs(Cross(d1, d2)) < 0.2)
+                return BuildCloudAroundPoints(new[] { legEnd, corner, branchEnd });
+
+            double halfWidth = Math.Clamp(Math.Min(legLen, branchLen) * 0.20, 20.0, 120.0);
+            Point2d Local(double leg, double branch) => Offset(Offset(corner, d1, leg), d2, branch);
+
+            var corners = new List<Point2d>
+            {
+                Local(0, -halfWidth),
+                Local(legLen, -halfWidth),
+                Local(legLen, halfWidth),
+                Local(halfWidth, halfWidth),
+                Local(halfWidth, branchLen),
+                Local(-halfWidth, branchLen),
+                Local(-halfWidth, -halfWidth),
+            };
+            return BuildClosedCloudPath(corners, halfWidth);
+        }
+
+        private static Polyline BuildCloudAroundPoints(IEnumerable<Point2d> points)
+        {
+            var pts = points.ToList();
+            double minX = pts.Min(p => p.X), minY = pts.Min(p => p.Y);
+            double maxX = pts.Max(p => p.X), maxY = pts.Max(p => p.Y);
+            double margin = Math.Max((maxX - minX + maxY - minY) * 0.08, 10.0);
+            return BuildCloudPolyline(minX - margin, minY - margin, maxX + margin, maxY + margin);
+        }
+
+        private static Polyline BuildSegmentCloudPolyline(Point2d a, Point2d b)
+        {
+            double len = a.GetDistanceTo(b);
+            if (len <= 1e-6)
+                return BuildCloudAroundPoints(new[] { a, b });
+
+            var d = a.GetVectorTo(b).GetNormal();
+            var n = new Vector2d(-d.Y, d.X);
+            double halfWidth = Math.Clamp(len * 0.18, 12.0, 45.0);
+            double cap = Math.Clamp(halfWidth * 0.30, 6.0, 18.0);
+            var corners = new List<Point2d>
+            {
+                Offset(Offset(a, d, -cap), n, halfWidth),
+                Offset(Offset(b, d, cap), n, halfWidth),
+                Offset(Offset(b, d, cap), n, -halfWidth),
+                Offset(Offset(a, d, -cap), n, -halfWidth),
+            };
+            return BuildClosedCloudPath(corners, halfWidth);
+        }
+
+        private static Polyline BuildClosedCloudPath(IReadOnlyList<Point2d> corners, double halfWidth)
+        {
+            double arcStep = Math.Max(halfWidth * 0.65, 1.0);
+            var pts = new List<Point2d>();
+            void AddSeg(Point2d a, Point2d b)
+            {
+                double dx = b.X - a.X, dy = b.Y - a.Y;
+                double len = Math.Sqrt(dx * dx + dy * dy);
+                int n = Math.Max(1, (int)(len / arcStep));
+                for (int i = 0; i < n; i++)
+                    pts.Add(new Point2d(a.X + dx * i / n, a.Y + dy * i / n));
+            }
+
+            for (int i = 0; i < corners.Count; i++)
+                AddSeg(corners[i], corners[(i + 1) % corners.Count]);
+
+            double bulge = SignedArea(corners) < 0 ? -CloudBulge : CloudBulge;
+            var pline = new Polyline();
+            for (int i = 0; i < pts.Count; i++)
+                pline.AddVertexAt(i, pts[i], bulge, 0, 0);
+            pline.Closed = true;
+            pline.ConstantWidth = Math.Clamp(halfWidth * 0.10, 2.0, 12.0);
+            return pline;
+        }
+
+        private static Point2d Offset(Point2d p, Vector2d v, double scale) =>
+            new Point2d(p.X + v.X * scale, p.Y + v.Y * scale);
+
+        private static double Cross(Vector2d a, Vector2d b) => a.X * b.Y - a.Y * b.X;
+
+        private static double SignedArea(IReadOnlyList<Point2d> pts)
+        {
+            double area = 0.0;
+            for (int i = 0; i < pts.Count; i++)
+            {
+                var a = pts[i];
+                var b = pts[(i + 1) % pts.Count];
+                area += (a.X * b.Y) - (b.X * a.Y);
+            }
+            return area * 0.5;
+        }
+
         internal static Polyline BuildCloudPolyline(double x1, double y1, double x2, double y2)
         {
             double w = x2 - x1, h = y2 - y1;
             double arcStep = Math.Max(Math.Min(w, h) / 4.0, 1.0);
-            const double bulge = 0.5;
-
             var pts = new List<Point2d>();
             void AddSeg(double ax, double ay, double bx, double by)
             {
@@ -272,7 +560,7 @@ namespace CadSllmAgent.Review
 
             var pline = new Polyline();
             for (int i = 0; i < pts.Count; i++)
-                pline.AddVertexAt(i, pts[i], bulge, 0, 0);
+                pline.AddVertexAt(i, pts[i], CloudBulge, 0, 0);
             pline.Closed = true;
             pline.ConstantWidth = Math.Clamp(Math.Min(w, h) * 0.005, 2.0, 15.0);
             return pline;
@@ -352,6 +640,31 @@ namespace CadSllmAgent.Review
             var layer = new LayerTableRecord { Name = layerName };
             lt.Add(layer);
             tr.AddNewlyCreatedDBObject(layer, true);
+        }
+
+        // 도면에 등록되지 않은 Linetype을 ACAD 표준 라이브러리에서 로드한다.
+        // 로드 실패 시 호출자는 BYLAYER 로 두어야 한다 (eKeyNotFound 방지).
+        private static bool EnsureLinetype(Database db, Transaction tr, string linetypeName)
+        {
+            if (string.IsNullOrWhiteSpace(linetypeName)) return false;
+
+            var ltt = (LinetypeTable)tr.GetObject(db.LinetypeTableId, OpenMode.ForRead);
+            if (ltt.Has(linetypeName)) return true;
+
+            foreach (var fileName in new[] { "acad.lin", "acadiso.lin" })
+            {
+                try
+                {
+                    db.LoadLineTypeFile(linetypeName, fileName);
+                    ltt = (LinetypeTable)tr.GetObject(db.LinetypeTableId, OpenMode.ForRead);
+                    if (ltt.Has(linetypeName)) return true;
+                }
+                catch
+                {
+                    // 다음 표준 파일로 폴백
+                }
+            }
+            return false;
         }
 
         private static void RegisterXDataApp(Database db, Transaction tr)

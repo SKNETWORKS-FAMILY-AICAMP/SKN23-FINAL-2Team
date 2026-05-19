@@ -19,12 +19,14 @@ namespace CadSllmAgent.UI
     {
         static PaletteSet? _ps      = null;
         static WebView2?   _webView = null;
-        static bool        _isOn    = false;
         static string      _lastAgent = "";   // 마지막으로 열린 에이전트 ID
-        const int FixedPaletteWidth = 490;
+        static string?     _resolvedFrontendBaseUrl = null;
+        static System.Drawing.Size? _lastPaletteSize = null;
+        const int MinimumPaletteWidth = 490;
+        const int DefaultPaletteWidth = MinimumPaletteWidth;
         const int DefaultPaletteHeight = 800;
         const int MinimumPaletteHeight = 600;
-        static System.Windows.Forms.Timer? _fixedSizeTimer = null;
+        static System.Windows.Forms.Timer? _minimumWidthTimer = null;
 
         // ── 공개 메서드 ───────────────────────────────────────────────
 
@@ -35,9 +37,11 @@ namespace CadSllmAgent.UI
         /// </summary>
         public static void ShowWithAgent(string agentId)
         {
+            if (DispatchIfNeeded(() => ShowWithAgent(agentId))) return;
+
             _lastAgent = agentId;
 
-            if (!_isOn)
+            if (!IsPaletteVisible())
                 OpenPalette();
 
             // React에 에이전트 전환 + 현재 DWG 파일명 전달
@@ -49,6 +53,7 @@ namespace CadSllmAgent.UI
             };
             string json = JsonSerializer.Serialize(new { action = "OPEN_AGENT", payload });
             PostMessage(json);
+            SyncTempSpecLinkFromDisk();
 
             Log($"[CAD-Agent] {agentId} 에이전트 활성화 — {dwgName}");
         }
@@ -56,14 +61,20 @@ namespace CadSllmAgent.UI
         /// <summary>팔레트를 연다. 이미 열려있으면 무시.</summary>
         public static void Show()
         {
-            if (_isOn) return;
+            if (DispatchIfNeeded(Show)) return;
+
+            if (IsPaletteVisible())
+                return;
+
             OpenPalette();
         }
 
         /// <summary>팔레트 ON/OFF 토글.</summary>
         public static void Toggle()
         {
-            if (_isOn) ClosePalette();
+            if (DispatchIfNeeded(Toggle)) return;
+
+            if (IsPaletteVisible()) ClosePalette();
             else
             {
                 OpenPalette();
@@ -79,6 +90,7 @@ namespace CadSllmAgent.UI
         {
             try
             {
+                SafeTaskDispatcher.CaptureUiDispatcher();
                 if (_ps == null)
                 {
                     _ps = new PaletteSet(
@@ -89,24 +101,34 @@ namespace CadSllmAgent.UI
                                      PaletteSetStyles.ShowCloseButton;
                     _ps.DockEnabled = DockSides.Left | DockSides.Right;
                     _ps.Dock        = DockSides.Right;
-                    _ps.Size        = new System.Drawing.Size(FixedPaletteWidth, DefaultPaletteHeight);
-                    _ps.MinimumSize = new System.Drawing.Size(FixedPaletteWidth, MinimumPaletteHeight);
+                    _ps.Size        = new System.Drawing.Size(DefaultPaletteWidth, DefaultPaletteHeight);
+                    _ps.MinimumSize = new System.Drawing.Size(MinimumPaletteWidth, MinimumPaletteHeight);
 
                     _ps.StateChanged += (s, e) =>
                     {
-                        if (_ps != null && !_ps.Visible)
-                            SetOff();
+                        if (_ps == null) return;
+
+                        if (_ps.Visible)
+                            StartMinimumWidthGuard();
+                        else
+                        {
+                            RememberPaletteSize();
+                            StopMinimumWidthGuard();
+                        }
                     };
 
                     _webView = new WebView2();
+                    SafeTaskDispatcher.CaptureUiDispatcher(_webView.Dispatcher);
 
-                    _webView.CoreWebView2InitializationCompleted += (s, e) =>
+                    _webView.CoreWebView2InitializationCompleted += async (s, e) =>
                     {
                         if (!e.IsSuccess)
                         {
                             Log($"[WebView2 초기화 실패]: {e.InitializationException?.Message}");
                             return;
                         }
+
+                        await ClearWebViewFrontendCacheAsync();
 
                         // React → C# 메시지 수신 (REACT_READY 등)
                         _webView.CoreWebView2.WebMessageReceived += (sender, args) =>
@@ -128,11 +150,16 @@ namespace CadSllmAgent.UI
                                     PluginEntry.OrgId    = p.TryGetProperty("org_id",    out var o) ? (o.GetString() ?? "") : "";
                                     PluginEntry.DeviceId = p.TryGetProperty("device_id", out var d) ? (d.GetString() ?? "") : "";
                                     Log($"[CAD-Agent] SESSION_INFO 수신 → OrgId={PluginEntry.OrgId}, DeviceId={PluginEntry.DeviceId}");
+                                    DrawingRevisionTracker.RefreshSnapshotBaselineForActiveDocument("session_info");
                                 }
                                 else if (action == "TEMP_SPEC_SELECTION")
                                 {
                                     var payload = doc.RootElement.GetProperty("payload");
                                     HandleTempSpecSelectionPayload(payload);
+                                }
+                                else if (action == "TEMP_SPEC_LINK_CLEAR_CURRENT")
+                                {
+                                    HandleTempSpecLinkClearCurrent();
                                 }
                                 else if (action == "NATIVE_UNMAPPED_ALERT")
                                 {
@@ -175,8 +202,7 @@ namespace CadSllmAgent.UI
                             }
                         };
 
-                        _webView.Source = new Uri(AgentConfig.FrontendBaseUrl);
-                        Log($"[CAD-Agent] WebView2 Navigate → {AgentConfig.FrontendBaseUrl}");
+                        await NavigateFrontendAsync();
 
                         // 테마 동기화. 에이전트 전환(OPEN_AGENT)은 REACT_READY 수신 후 전송.
                         _webView.NavigationCompleted += (sender, args) =>
@@ -200,15 +226,13 @@ namespace CadSllmAgent.UI
                     _ps.Add(" ", host);
                 }
 
+                RestorePaletteSize();
                 _ps.Visible = true;
-                _ps.Dock    = DockSides.Right;
-                EnforceFixedPaletteWidth();
-                StartFixedSizeGuard();
+                EnforceMinimumPaletteWidth();
+                StartMinimumWidthGuard();
 
                 if (_webView != null && _webView.CoreWebView2 == null)
                     _ = InitWebViewAsync();
-
-                SetOn();
             }
             catch (System.Exception ex)
             {
@@ -218,44 +242,88 @@ namespace CadSllmAgent.UI
 
         private static void ClosePalette()
         {
+            RememberPaletteSize();
             if (_ps != null) _ps.Visible = false;
-            StopFixedSizeGuard();
-            SetOff();
+            StopMinimumWidthGuard();
         }
 
-        private static void EnforceFixedPaletteWidth()
+        private static bool IsPaletteVisible()
+        {
+            try
+            {
+                return _ps?.Visible == true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void RememberPaletteSize()
         {
             if (_ps == null) return;
-            var current = _ps.Size;
-            if (current.Width == FixedPaletteWidth) return;
 
-            int height = Math.Max(current.Height, MinimumPaletteHeight);
-            _ps.Size = new System.Drawing.Size(FixedPaletteWidth, height);
+            var current = _ps.Size;
+            if (current.Width <= 0 || current.Height <= 0) return;
+
+            _lastPaletteSize = new System.Drawing.Size(
+                Math.Max(current.Width, MinimumPaletteWidth),
+                Math.Max(current.Height, MinimumPaletteHeight));
         }
 
-        private static void StartFixedSizeGuard()
+        private static void RestorePaletteSize()
         {
-            if (_fixedSizeTimer != null) return;
+            if (_ps == null || !_lastPaletteSize.HasValue) return;
 
-            _fixedSizeTimer = new System.Windows.Forms.Timer { Interval = 250 };
-            _fixedSizeTimer.Tick += (s, e) =>
+            var size = _lastPaletteSize.Value;
+            _ps.Size = new System.Drawing.Size(
+                Math.Max(size.Width, MinimumPaletteWidth),
+                Math.Max(size.Height, MinimumPaletteHeight));
+        }
+
+        private static void EnforceMinimumPaletteWidth()
+        {
+            if (_ps == null) return;
+
+            var current = _ps.Size;
+            int width = Math.Max(current.Width, MinimumPaletteWidth);
+            int height = Math.Max(current.Height, MinimumPaletteHeight);
+
+            if (current.Width == width && current.Height == height)
+            {
+                RememberPaletteSize();
+                return;
+            }
+
+            _ps.Size = new System.Drawing.Size(width, height);
+            RememberPaletteSize();
+        }
+
+        private static void StartMinimumWidthGuard()
+        {
+            if (_minimumWidthTimer != null) return;
+
+            _minimumWidthTimer = new System.Windows.Forms.Timer { Interval = 150 };
+            _minimumWidthTimer.Tick += (s, e) =>
             {
                 if (_ps == null || !_ps.Visible)
                 {
-                    StopFixedSizeGuard();
+                    StopMinimumWidthGuard();
                     return;
                 }
-                EnforceFixedPaletteWidth();
+
+                EnforceMinimumPaletteWidth();
             };
-            _fixedSizeTimer.Start();
+            _minimumWidthTimer.Start();
         }
 
-        private static void StopFixedSizeGuard()
+        private static void StopMinimumWidthGuard()
         {
-            if (_fixedSizeTimer == null) return;
-            _fixedSizeTimer.Stop();
-            _fixedSizeTimer.Dispose();
-            _fixedSizeTimer = null;
+            if (_minimumWidthTimer == null) return;
+
+            _minimumWidthTimer.Stop();
+            _minimumWidthTimer.Dispose();
+            _minimumWidthTimer = null;
         }
 
         // ── 상태 동기화 ───────────────────────────────────────────────
@@ -305,8 +373,13 @@ namespace CadSllmAgent.UI
             PostMessage(json);
         }
 
-        private static void SetOn()  => _isOn = true;
-        private static void SetOff() => _isOn = false;
+        private static bool DispatchIfNeeded(Action action)
+        {
+            var dispatcher = _webView?.Dispatcher ?? System.Windows.Application.Current?.Dispatcher;
+            if (dispatcher == null || dispatcher.CheckAccess()) return false;
+            dispatcher.InvokeAsync(action);
+            return true;
+        }
 
         // ── 유틸 ─────────────────────────────────────────────────────
 
@@ -323,6 +396,77 @@ namespace CadSllmAgent.UI
             return "untitled.dwg";
         }
 
+        private static async Task<string> ResolveFrontendBaseUrlAsync()
+        {
+            if (_resolvedFrontendBaseUrl == AgentConfig.LocalFrontendBaseUrl)
+                return _resolvedFrontendBaseUrl;
+
+            if (AgentConfig.PreferLocalFrontendWhenAvailable &&
+                await IsFrontendReachableAsync(AgentConfig.LocalFrontendBaseUrl))
+            {
+                _resolvedFrontendBaseUrl = AgentConfig.LocalFrontendBaseUrl;
+                return _resolvedFrontendBaseUrl;
+            }
+
+            return AgentConfig.FrontendBaseUrl;
+        }
+
+        private static async Task<bool> IsFrontendReachableAsync(string url)
+        {
+            try
+            {
+                using var client = new System.Net.Http.HttpClient
+                {
+                    Timeout = TimeSpan.FromMilliseconds(700)
+                };
+                using var response = await client.GetAsync(url);
+                return response.IsSuccessStatusCode;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static Uri GetFrontendUri(string baseUrl)
+        {
+            string separator = baseUrl.Contains("?") ? "&" : "?";
+            string token = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString();
+            return new Uri($"{baseUrl}{separator}cad=1&v={token}");
+        }
+
+        private static async Task NavigateFrontendAsync()
+        {
+            if (_webView == null) return;
+
+            string baseUrl = await ResolveFrontendBaseUrlAsync();
+            Uri uri = GetFrontendUri(baseUrl);
+            if (_webView.CoreWebView2 != null)
+                _webView.CoreWebView2.Navigate(uri.ToString());
+            else
+                _webView.Source = uri;
+
+            Log($"[CAD-Agent] WebView2 Navigate -> {uri}");
+        }
+
+        private static async Task ClearWebViewFrontendCacheAsync()
+        {
+            try
+            {
+                var profile = _webView?.CoreWebView2?.Profile;
+                if (profile == null) return;
+
+                var kinds = CoreWebView2BrowsingDataKinds.DiskCache |
+                            CoreWebView2BrowsingDataKinds.CacheStorage |
+                            CoreWebView2BrowsingDataKinds.ServiceWorkers;
+                await profile.ClearBrowsingDataAsync(kinds);
+            }
+            catch (System.Exception ex)
+            {
+                Log($"[WebView2 cache clear failed]: {ex.Message}");
+            }
+        }
+
         private static async Task InitWebViewAsync()
         {
             try
@@ -330,7 +474,7 @@ namespace CadSllmAgent.UI
                 string folder = Path.Combine(Path.GetTempPath(), "CadSllmAgent_WebView2");
                 var env = await CoreWebView2Environment.CreateAsync(null, folder, null);
                 await _webView!.EnsureCoreWebView2Async(env);
-                _webView.Source = new Uri(AgentConfig.FrontendBaseUrl);
+                await NavigateFrontendAsync();
             }
             catch (System.Exception ex)
             {
@@ -356,7 +500,13 @@ namespace CadSllmAgent.UI
         /// <summary>React(WebView2)에 JSON 메시지를 직접 전송한다.</summary>
         public static void PostMessage(string json)
         {
-            try { _webView?.CoreWebView2?.PostWebMessageAsString(json); }
+            if (_webView == null) return;
+            if (!_webView.Dispatcher.CheckAccess())
+            {
+                _webView.Dispatcher.InvokeAsync(() => PostMessage(json));
+                return;
+            }
+            try { _webView.CoreWebView2?.PostWebMessageAsString(json); }
             catch (System.Exception ex) { Log($"[PostMessage 오류]: {ex.Message}"); }
         }
 
@@ -377,17 +527,44 @@ namespace CadSllmAgent.UI
             }
         }
 
+        public static void HandleTempSpecLinkClearCurrent()
+        {
+            try
+            {
+                var dwgDir = TempSpecLinkService.GetActiveDwgDirectory();
+                if (!string.IsNullOrEmpty(dwgDir))
+                    TempSpecLinkService.DeleteLinkJson(dwgDir);
+                PostMessage("{\"action\":\"TEMP_SPEC_LINK_CLEARED\"}");
+            }
+            catch (System.Exception ex)
+            {
+                Log($"[TEMP_SPEC_LINK_CLEAR_CURRENT 처리 오류]: {ex.Message}");
+            }
+        }
+
         /// <summary>디스크의 link.json을 읽어 팔레트 React에 전달 (도면 전환 시).</summary>
         public static void SyncTempSpecLinkFromDisk(string? dwgDir = null)
         {
             try
             {
                 dwgDir ??= TempSpecLinkService.GetActiveDwgDirectory();
-                if (string.IsNullOrEmpty(dwgDir)) return;
+                if (string.IsNullOrEmpty(dwgDir))
+                {
+                    PostMessage("{\"action\":\"TEMP_SPEC_LINK_CLEARED\"}");
+                    return;
+                }
                 var json = TempSpecLinkService.ReadLinkJson(dwgDir);
-                if (string.IsNullOrEmpty(json)) return;
+                if (string.IsNullOrEmpty(json))
+                {
+                    PostMessage("{\"action\":\"TEMP_SPEC_LINK_CLEARED\"}");
+                    return;
+                }
                 var trimmed = json.Trim();
-                if (!trimmed.StartsWith("{")) return;
+                if (!trimmed.StartsWith("{"))
+                {
+                    PostMessage("{\"action\":\"TEMP_SPEC_LINK_CLEARED\"}");
+                    return;
+                }
                 PostMessage("{\"action\":\"TEMP_SPEC_LINK_LOADED\",\"payload\":" + trimmed + "}");
             }
             catch (System.Exception ex)
@@ -436,7 +613,11 @@ namespace CadSllmAgent.UI
 
             try
             {
-                AcApp.Idle += OnIdleOnce;
+                SafeTaskDispatcher.EnqueueSafeTask(() =>
+                {
+                    try { AcApp.Idle += OnIdleOnce; }
+                    catch { }
+                });
             }
             catch (Exception ex)
             {

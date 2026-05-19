@@ -25,7 +25,7 @@ from copy import deepcopy
 from typing import Any
 
 from pydantic import BaseModel, Field
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text as sa_text, select
 
@@ -185,6 +185,11 @@ async def analyze_cad(
     focus_raw = raw_payload.get("focus_drawing_data")
     active_object_ids = raw_payload.get("active_object_ids", [])
     session_id = payload.get("session_id")
+    drawing_id = raw_payload.get("drawing_id") or ""
+    # C#이 선택적으로 전달하는 파일 fingerprint (file_path + file_size + last_write_time 조합 등)
+    file_fingerprint: str = (
+        raw_payload.get("file_fingerprint") or raw_payload.get("drawing_fingerprint") or ""
+    )
     # C# ApiClient: review_tool(신규) / piping_tool(구형 호환), domain_type, dwg_compare_mode (추적용)
     _pt = raw_payload.get("review_tool") or raw_payload.get("piping_tool")
     _dc = raw_payload.get("dwg_compare_mode")
@@ -384,15 +389,60 @@ async def analyze_cad(
         revision_hash = hashlib.sha256(
             json.dumps(drawing_data, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
-        s3_uri = await cad_service.save_to_s3(str(session_id), drawing_data, o, d)
-        if not s3_uri:
-            raise HTTPException(
-                status_code=502,
-                detail="S3에 도면을 저장하지 못했습니다. 자격 증명·버킷·네트워크를 확인하세요.",
+        # Issue 3: effective_s3_uri 분기 — drawing_id 있으면 snapshot 경로, 없으면 legacy 경로
+        snapshot_id: str | None = None
+        if drawing_id:
+            from uuid import uuid4 as _uuid4
+            from backend.services.drawing_state_service import DrawingStateService
+            from backend.core.redis_client import get_redis_client
+            from backend.utils.s3_manager import S3Manager
+            snapshot_id = f"snap_{_uuid4().hex}"
+            effective_s3_uri = await cad_service.save_snapshot_to_s3(
+                o, drawing_id, snapshot_id, drawing_data
             )
+            if not effective_s3_uri:
+                raise HTTPException(
+                    status_code=502,
+                    detail="S3에 snapshot을 저장하지 못했습니다. 자격 증명·버킷·네트워크를 확인하세요.",
+                )
+            dss = DrawingStateService(redis=get_redis_client(), s3=S3Manager())
+            if file_fingerprint:
+                fp_result = await dss.check_and_store_fingerprint(drawing_id, file_fingerprint)
+                if fp_result == "mismatch":
+                    logging.warning(
+                        "[CAD Interop] file_fingerprint mismatch — drawing_id=%s가 다른 파일로 재사용됨. "
+                        "stale dirty/delta 캐시를 정리합니다.",
+                        drawing_id,
+                    )
+                    await dss.clear_stale_caches(drawing_id)
+                else:
+                    logging.info(
+                        "[CAD Interop] file_fingerprint %s drawing_id=%s",
+                        fp_result, drawing_id,
+                    )
+            await dss.register_initial_snapshot(
+                drawing_id=drawing_id,
+                snapshot_id=snapshot_id,
+                s3_uri=effective_s3_uri,
+                entity_count=entity_count,
+                revision_hash=revision_hash,
+                session_id=str(session_id) if session_id else None,
+            )
+            logging.info(
+                "[CAD Interop] drawing state registered drawing_id=%s snapshot_id=%s",
+                drawing_id, snapshot_id,
+            )
+        else:
+            effective_s3_uri = await cad_service.save_to_s3(str(session_id), drawing_data, o, d)
+            if not effective_s3_uri:
+                raise HTTPException(
+                    status_code=502,
+                    detail="S3에 도면을 저장하지 못했습니다. 자격 증명·버킷·네트워크를 확인하세요.",
+                )
+
         await cad_service.cache_drawing_path(
             str(session_id),
-            s3_uri,
+            effective_s3_uri,
             revision_hash=revision_hash,
         )
         # 도면이 갱신됐으므로 이전 위치 매핑 캐시 무효화 (수정된 도면에 구 캐시 적용 방지)
@@ -441,6 +491,10 @@ async def analyze_cad(
             "unmapped_layers": unmapped_layers,
             "org_id": o,
             "drawing_revision": revision_hash,
+            "drawing_id": drawing_id or None,
+            "snapshot_id": snapshot_id,
+            "currentSnapshotPath": effective_s3_uri if drawing_id else None,  # Issue 3
+            "file_fingerprint": file_fingerprint or None,
         }
         fe = drawing_data.get("focus_extraction")
         if isinstance(fe, dict):
@@ -469,6 +523,8 @@ async def analyze_cad(
         return {
             "status": "success",
             "session_id": session_id,
+            "drawing_id": drawing_id or None,
+            "snapshot_id": snapshot_id,
             "message": "CAD data received and storage process started."
         }
 
@@ -478,11 +534,7 @@ async def analyze_cad(
 
 
 # ── 매핑 디버그 API ─────────────────────────────────────────────────────────────
-
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text as sa_text
-from backend.core.database import get_db
-from fastapi import Depends, Query
+# (AsyncSession, sa_text, get_db, Depends, Query 는 파일 상단에서 import 완료)
 
 
 @router.get("/debug/standard-terms")

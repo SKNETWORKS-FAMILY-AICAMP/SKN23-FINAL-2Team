@@ -46,6 +46,18 @@ NODE_LABEL_KO: dict[str, str] = {
     "pipe_review_qa": "도면 품질검사",
     "pipe_review_report": "검토 리포트 생성",
     "pipe_review_revision": "수정안 계산",
+    "elec_review_enter": "전기 검토 노드 진입",
+    "elec_intent": "전기 의도 분석",
+    "elec_layout_split": "도면 엔티티 역할 분류",
+    "elec_mapping": "전기 이름·위치 매핑",
+    "elec_tool_select": "전기 도구 선택",
+    "elec_tool_run": "전기 서브 에이전트 실행",
+    "elec_review_parse": "도면 요소 파싱",
+    "elec_review_rag_topology": "Topology/Geometry/RAG 병렬 처리",
+    "elec_review_compliance": "시방·규정 검증",
+    "elec_review_deterministic": "확정 규칙 검사",
+    "elec_review_report": "검토 리포트 생성",
+    "elec_review_revision": "수정안 계산",
     "__done__": "에이전트 파이프라인 완료",
 }
 

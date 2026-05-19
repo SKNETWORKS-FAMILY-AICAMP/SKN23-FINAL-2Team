@@ -14,6 +14,18 @@ export interface MessageSource {
   url?: string;
 }
 
+export interface SuggestedQuery {
+  label: string;
+  query: string;
+}
+
+export interface ResponseMeta {
+  answer_type?: string;
+  used_rag?: boolean;
+  suggested_queries?: SuggestedQuery[];
+  [key: string]: unknown;
+}
+
 export interface Message {
   id: string;
   sender: "user" | "agent" | "system";
@@ -26,6 +38,8 @@ export interface Message {
   streaming?: boolean;                 // true이면 ChatBubble이 타이핑 효과 적용
   thinkingLogs?: string[];             // 분석 과정 로그 (영구 보관용)
   thinkingTime?: number;               // 분석에 걸린 시간 (초)
+  response_meta?: ResponseMeta;        // 백엔드 response_meta (suggested_queries 등)
+  domain?: string;                     // 메시지 발신 시 도메인 ("elec" 등)
 }
 
 export interface Violation {
@@ -55,6 +69,16 @@ export interface AnnotatedEntity {
   violation?: Violation;
 }
 
+export interface CreationProposal {
+  proposal_id: string;
+  count: number;
+  handles: string[];
+  layers: string[];
+  description: string;
+  delete_count?: number;
+  proposal_type?: "create" | "replace" | "modify";
+}
+
 export interface DomainMismatchInfo {
   predicted_domain: string;
   predicted_domain_kr: string;
@@ -67,6 +91,30 @@ export interface DomainMismatchInfo {
 
 /** 'full' = 도면 전체 추출, 'focus' = 선택 객체 부분 추출 */
 export type ExtractionMode = "full" | "focus";
+
+export type DrawingStatus =
+  | "LATEST" | "DIRTY" | "INCREMENTAL_PENDING" | "INCREMENTAL_READY"
+  | "FULL_RESYNC_PENDING" | "FULL_RESYNC_RUNNING" | "RESYNC_FAILED"
+  | "REVIEW_REQUIRED";
+
+export type DrawingChangeMode =
+  | "NONE" | "INCREMENTAL_PENDING" | "INCREMENTAL_READY"
+  | "FULL_RESYNC_PENDING" | "FULL_RESYNC_RUNNING";
+
+export interface DrawingState {
+  drawingId:              string;
+  status:                 DrawingStatus;
+  changeMode:             DrawingChangeMode;
+  dirtyCount:             number;
+  deltaCount:             number;
+  deltaSize:              number;
+  currentSnapshotId:      string | null;
+  currentSnapshotPath:    string | null;
+  latestDeltaPath:        string | null;
+  pendingAfterResync:     boolean;
+  canReviewStaleSnapshot: boolean;
+  lastError:              string | null;
+}
 
 interface AgentState {
   messages: Message[];
@@ -88,6 +136,8 @@ interface AgentState {
   /** CAD_DATA_READY / CAD_ANALYZE_COMPLETE — unmappedLayers는 배관 매핑 미해결 레이어 목록 */
   cadEvent: { sessionId: string; ts: number; unmappedLayers?: string[] } | null;
   domainMismatch: DomainMismatchInfo | null;
+  /** CAD_DATA_READY에서 수신한 파일 변경 감지용 fingerprint (없으면 null) */
+  fileFingerprint: string | null;
 
   addMessage: (msg: Message) => void;
   setMessages: (msgs: Message[]) => void;
@@ -104,10 +154,18 @@ interface AgentState {
   setSelectedSpecIds: (ids: string[]) => void;
   setSelectedTempSpecIds: (ids: string[]) => void;
   setCadSessionId: (sessionId: string, unmappedLayers?: string[]) => void;
+  clearCadSessionId: () => void;
   setDomainMismatch: (info: DomainMismatchInfo) => void;
   clearDomainMismatch: () => void;
   clearCadUnmapped: () => void;
   clearResults: () => void;
+  drawingState: DrawingState | null;
+  setDrawingState: (state: DrawingState) => void;
+  clearDrawingState: () => void;
+  setFileFingerprint: (fp: string | null) => void;
+  pendingCreationProposals: CreationProposal[];
+  addCreationProposal: (p: CreationProposal) => void;
+  removeCreationProposal: (proposalId: string) => void;
 }
 
 export const useAgentStore = create<AgentState>((set) => ({
@@ -122,6 +180,9 @@ export const useAgentStore = create<AgentState>((set) => ({
   extractionMode: "full",
   cadEvent: null,
   domainMismatch: null,
+  fileFingerprint: null,
+  drawingState: null,
+  pendingCreationProposals: [],
 
   addMessage: (msg) => set((state) => ({ messages: [...state.messages, msg] })),
   setMessages: (msgs) => set({ messages: msgs }),
@@ -150,7 +211,7 @@ export const useAgentStore = create<AgentState>((set) => ({
           stepMs: payload.stepMs,
           totalMs: payload.totalMs,
         },
-        progressLogs: [...state.progressLogs, payload.message],
+        progressLogs: [...state.progressLogs, payload.message].slice(-5),
       };
     }),
   setReviewResults: (data) =>
@@ -174,6 +235,7 @@ export const useAgentStore = create<AgentState>((set) => ({
           : {}),
       },
     }),
+  clearCadSessionId: () => set({ cadEvent: null }),
   setDomainMismatch: (info) => set({ domainMismatch: info, isAnalyzing: false }),
   clearDomainMismatch: () => set({ domainMismatch: null }),
   clearCadUnmapped: () =>
@@ -192,6 +254,22 @@ export const useAgentStore = create<AgentState>((set) => ({
       progressLine: null,
       progressLogs: [],
     }),
+  setDrawingState: (state) => set({ drawingState: state }),
+  clearDrawingState: () => set({ drawingState: null }),
+  setFileFingerprint: (fp) => set({ fileFingerprint: fp }),
+  addCreationProposal: (p) =>
+    set((s) => ({
+      pendingCreationProposals: [
+        ...s.pendingCreationProposals.filter((x) => x.proposal_id !== p.proposal_id),
+        p,
+      ],
+    })),
+  removeCreationProposal: (proposalId) =>
+    set((s) => ({
+      pendingCreationProposals: s.pendingCreationProposals.filter(
+        (x) => x.proposal_id !== proposalId,
+      ),
+    })),
 }));
 
 export default useAgentStore;

@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 	<PropertyGroup>
 		<TargetFramework>net10.0-windows</TargetFramework>
 		<UseWindowsForms>true</UseWindowsForms>
@@ -6,7 +6,9 @@
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
 		<GenerateAssemblyInfo>false</GenerateAssemblyInfo>
-<NoWarn>$(NoWarn);3305</NoWarn>
+		<PlatformTarget>x64</PlatformTarget>
+		<Prefer32Bit>false</Prefer32Bit>
+		<NoWarn>$(NoWarn);NU1701;3305</NoWarn>
 	</PropertyGroup>
 	<ItemGroup>
 	  <COMReference Include="AXDBLib">
@@ -29,7 +31,9 @@
 	  </COMReference>
 	</ItemGroup>
 	<ItemGroup>
-		<PackageReference Include="AutoCAD.NET" Version="*" ExcludeAssets="runtime" />
+		<!-- AutoCAD.NET: Version="*" 사용 시 외부에서 broken metadata (예: 25.0.0의 V058 transitive) 를
+		     게시하면 빌드가 중단되므로 안정 버전(24.0.0, AutoCAD 2024)으로 고정. 2027 후방호환 OK. -->
+		<PackageReference Include="AutoCAD.NET" Version="24.0.0" ExcludeAssets="runtime" />
 		<PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3065.39" />
 	</ItemGroup>
 	<ItemGroup>

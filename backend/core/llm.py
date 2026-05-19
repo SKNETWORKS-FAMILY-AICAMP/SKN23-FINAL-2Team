@@ -3,7 +3,7 @@ from langchain_openai import ChatOpenAI
 from backend.core.config import settings
 
 # OpenAI 테스트용 LLM 객체
-print(f"KEY CHECK: {settings.OPENAI_API_KEY[:10]}...")
+print(f"KEY CHECK: {(settings.OPENAI_API_KEY or '(NOT SET)')[:10]}...")
 llm = ChatOpenAI(
     model=settings.OPENAI_MODEL_NAME,
     api_key=settings.OPENAI_API_KEY,  # sk-proj-...

@@ -88,4 +88,8 @@ class ReportAgent:
         pa = violation.get("proposed_action")
         if isinstance(pa, dict) and pa:
             item["proposed_action"] = pa
+        for key in ("related_handles", "group_id", "display_object_id"):
+            value = violation.get(key)
+            if value:
+                item[key] = value
         return item

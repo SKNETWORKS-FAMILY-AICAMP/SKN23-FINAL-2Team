@@ -1,0 +1,23 @@
+# docker-compose.gpu.yml — NVIDIA GPU EC2 오버라이드 (g4dn / p3 등)
+#
+# 사용법:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# 요구 사항:
+#   - EC2 호스트: NVIDIA 드라이버 + nvidia-container-toolkit 설치
+#   - 참고: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile.gpu
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      CUDA_VISIBLE_DEVICES: "0"

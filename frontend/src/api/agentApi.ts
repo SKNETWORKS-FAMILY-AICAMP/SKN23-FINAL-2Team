@@ -19,10 +19,14 @@ import { getAgentApiHeaders } from "../utils/documentApiAuth";
 export interface AgentReviewRequest {
   sessionId: string;
   cadCacheId?: string;
+  drawingId?: string;
+  /** C# 플러그인이 CAD_DATA_READY 이후 전달하는 파일 변경 감지용 fingerprint (선택) */
+  fileFingerprint?: string;
   domain: string;
   activeObjectIds: string[];
   specDocumentIds?: string[];
   tempSpecIds?: string[];
+  projectId?: string;
   reviewMode: "KEC_ONLY" | "HYBRID";
   userPrompt?: string;
   orgId?: string;
@@ -60,15 +64,25 @@ export const agentApi = {
     payload: AgentReviewRequest,
   ): Promise<AgentReviewResponse> => {
     try {
+      const sessionId = (payload.sessionId || "").trim();
+      if (!sessionId) {
+        throw new Error("sessionId is required before starting review");
+      }
       const orgId = payload.orgId || localStorage.getItem("skn23_org_id") || "";
       const machineId = localStorage.getItem("skn23_machine_id") || "";
+      const cadCacheId = payload.cadCacheId || (payload.drawingId ? undefined : sessionId);
+      const specDocumentIds = (payload.specDocumentIds || []).filter(Boolean);
+      const tempSpecIds = (payload.tempSpecIds || []).filter(Boolean);
       const serverPayload = {
-        session_id: payload.sessionId,
-        cad_cache_id: payload.cadCacheId || payload.sessionId,
+        session_id: sessionId,
+        cad_cache_id: cadCacheId,
+        drawing_id: payload.drawingId || undefined,
+        file_fingerprint: payload.fileFingerprint || undefined,
         domain: payload.domain,
         active_object_ids: payload.activeObjectIds,
-        spec_document_ids: payload.specDocumentIds,
-        temp_spec_ids: payload.tempSpecIds,
+        spec_document_ids: specDocumentIds.length > 0 ? specDocumentIds : undefined,
+        temp_spec_ids: tempSpecIds.length > 0 ? tempSpecIds : undefined,
+        project_id: payload.projectId || undefined,
         review_mode: payload.reviewMode,
         user_prompt: payload.userPrompt,
         org_id: orgId,

@@ -31,15 +31,18 @@ class ConnectionManager:
             if websocket in self.active_connections[client_type]:
                 self.active_connections[client_type].remove(websocket)
 
-    async def send_to_group(self, message: dict, client_type: str):
+    async def send_to_group(self, message: dict, client_type: str) -> int:
         # CRIT-1: 순회 중 리스트 수정 금지 → dead 목록 분리 후 일괄 제거
         dead: list = []
+        sent = 0
         for connection in list(self.active_connections.get(client_type, [])):
             try:
                 await connection.send_json(message)
+                sent += 1
             except Exception:
                 dead.append(connection)
         for conn in dead:
             self.disconnect(conn, client_type)
+        return sent
 
 manager = ConnectionManager()

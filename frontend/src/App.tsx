@@ -9,6 +9,18 @@ export default function App() {
   const isApiView = window.location.search.includes("view=api");
   const apiRegistered = localStorage.getItem("skn23_api_key_registered") === "true";
 
+  // const apiRegistered = true;
+
+  // // 초기화: API 키 및 기본 ID 강제 설정
+  // React.useEffect(() => {
+  //   if (!localStorage.getItem("skn23_api_key_registered")) {
+  //     localStorage.setItem("skn23_api_key_registered", "true");
+  //     localStorage.setItem("skn23_api_key", "sk-test-key-by-antigravity");
+  //     localStorage.setItem("skn23_org_id", "demo-org-id");
+  //     localStorage.setItem("skn23_device_id", "demo-device-id");
+  //   }
+  // }, []);
+  
   if (isApiView) return <div className="w-full h-screen" style={{ background: C.bg }}><ApiKeyManagerModal isOpen={true} onClose={() => window.history.back()} /></div>;
 
   if (isSpecView) {

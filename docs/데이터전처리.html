@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>데이터 전처리 및 인공지능 모델 정리</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      @import url("https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css");
+
+      body {
+        font-family: "Pretendard", sans-serif;
+      }
+
+      @media print {
+        body {
+          background-color: white !important;
+        }
+
+        .page-break-before {
+          page-break-before: always;
+        }
+      }
+    </style>
+  </head>
+
+  <body class="bg-slate-100 py-8 px-4 sm:px-6 lg:px-8 text-slate-800">
+    <div class="max-w-5xl mx-auto bg-white shadow-sm border border-slate-300">
+      <!-- Document Header -->
+      <header class="border-b-[3px] border-slate-800 p-10 pb-8">
+        <div class="flex justify-between items-end">
+          <div>
+            <p
+              class="text-slate-500 font-semibold tracking-wider mb-2 text-xs uppercase"
+            >
+              Technical Document
+            </p>
+            <h1 class="text-3xl font-bold tracking-tight text-slate-900">
+              데이터 전처리 및 학습된 인공지능 모델
+            </h1>
+          </div>
+          <div class="text-right text-sm text-slate-500">
+            <p>문서 분류: 내부 대외비</p>
+          </div>
+        </div>
+      </header>
+
+      <!-- Document Content -->
+      <div class="p-10 space-y-12">
+        <!-- Section 1 -->
+        <section>
+          <h2
+            class="text-xl font-bold text-slate-900 border-b border-slate-200 pb-2 mb-6"
+          >
+            1. 모델 개요 및 적용 환경
+          </h2>
+          <div class="border border-slate-200 rounded-sm">
+            <table class="w-full text-sm text-left">
+              <tbody class="divide-y divide-slate-200">
+                <tr>
+                  <th
+                    class="w-1/4 bg-slate-50 px-6 py-4 font-semibold text-slate-700"
+                  >
+                    모델 목적
+                  </th>
+                  <td class="px-6 py-4">
+                    사용자가 업로드한 CAD 도면 파일(JSON 구조 변환)을 분석하여
+                    건축(arch), 배관(pipe), 소방(fire), 전기(elec) 중 하나의
+                    도메인으로 자동 분류
+                  </td>
+                </tr>
+                <tr>
+                  <th
+                    class="w-1/4 bg-slate-50 px-6 py-4 font-semibold text-slate-700"
+                  >
+                    알고리즘
+                  </th>
+                  <td class="px-6 py-4">
+                    CatBoostClassifier
+                    <span class="text-slate-500"
+                      >(대칭 트리 기반 그래디언트 부스팅)</span
+                    >
+                  </td>
+                </tr>
+                <tr>
+                  <th
+                    class="w-1/4 bg-slate-50 px-6 py-4 font-semibold text-slate-700"
+                  >
+                    적용 위치
+                  </th>
+                  <td class="px-6 py-4">
+                    Backend Server (<code
+                      class="text-slate-600 bg-slate-100 px-1 font-mono"
+                      >services/agent_service.py</code
+                    >) 내
+                    <code class="text-slate-600 bg-slate-100 px-1 font-mono"
+                      >DomainClassifier</code
+                    >
+                    래퍼 클래스로 통합 구동
+                  </td>
+                </tr>
+                <tr>
+                  <th
+                    class="w-1/4 bg-slate-50 px-6 py-4 font-semibold text-slate-700"
+                  >
+                    저장 포맷
+                  </th>
+                  <td class="px-6 py-4 space-x-2">
+                    <span
+                      class="inline-block bg-slate-100 text-slate-700 px-2 py-0.5 border border-slate-200 text-xs font-mono"
+                      >domain_classifier.pkl</span
+                    >
+                    <span
+                      class="inline-block bg-slate-100 text-slate-700 px-2 py-0.5 border border-slate-200 text-xs font-mono"
+                      >label_encoder.pkl</span
+                    >
+                    <span
+                      class="inline-block bg-slate-100 text-slate-700 px-2 py-0.5 border border-slate-200 text-xs font-mono"
+                      >domain_classifier_meta.json</span
+                    >
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- Section 2 -->
+        <section>
+          <div
+            class="flex justify-between items-end border-b border-slate-200 pb-2 mb-6"
+          >
+            <h2 class="text-xl font-bold text-slate-900">
+              2. 입력 데이터 명세
+            </h2>
+            <span class="text-sm font-semibold text-slate-600"
+              >Feature Vector: 74차원</span
+            >
+          </div>
+          <p
+            class="text-sm text-slate-600 mb-6 bg-slate-50 p-4 border-l-2 border-slate-400"
+          >
+            도면에서 추출된 기하 및 의미론적 특성은 아래 74차원의 실수(Float)
+            배열로 정규화되어 입력됩니다.
+          </p>
+          <div class="space-y-4 text-sm">
+            <div class="pl-4 border-l-[3px] border-slate-300">
+              <div class="font-bold text-slate-800 mb-1">
+                <span class="text-slate-500 mr-2">[A]</span>엔티티 타입 비율
+                (11차원)
+              </div>
+              <p class="text-slate-600">
+                LINE, TEXT, HATCH, CIRCLE 등 엔티티 빈도를 전체 개수로 나눈 비율
+              </p>
+            </div>
+            <div class="pl-4 border-l-[3px] border-slate-300">
+              <div class="font-bold text-slate-800 mb-1">
+                <span class="text-slate-500 mr-2">[B]</span>이진 존재 여부
+                (3차원)
+              </div>
+              <p class="text-slate-600">
+                도메인 특화 기하학 요소인 HATCH, ELLIPSE, SPLINE의 존재 여부 (0
+                or 1)
+              </p>
+            </div>
+            <div class="pl-4 border-l-[3px] border-slate-300">
+              <div class="font-bold text-slate-800 mb-1">
+                <span class="text-slate-500 mr-2">[C,D,F,G,H,K,L,M,N]</span
+                >구조/기하 통계 피처 (28차원)
+              </div>
+              <p class="text-slate-600">
+                파생 엔티티 비율합, 도면 스케일 단위(Unit) 원핫 인코딩, 레이어명
+                길이(평균/표준편차), 레이어명 스타일(한글/특수문자 비율), AIA
+                표준 접두어(A-/E-/F- 등) 비율, 색상 다양성 엔트로피, Bbox 면적
+                통계 등
+              </p>
+            </div>
+            <div class="pl-4 border-l-[3px] border-slate-300">
+              <div class="font-bold text-slate-800 mb-1">
+                <span class="text-slate-500 mr-2">[O]</span>레이어 도메인 키워드
+                가중 점수 (8차원)
+              </div>
+              <p class="text-slate-600">
+                도메인별 고유 키워드(예: 소방 spr, 전기 MCC) 매칭 시 최대
+                2.0~1.0 가중치를 부여한 합산 점수 및 히트 비율
+              </p>
+            </div>
+            <div class="pl-4 border-l-[3px] border-slate-300">
+              <div class="font-bold text-slate-800 mb-1">
+                <span class="text-slate-500 mr-2">[P]</span>TEXT 정규식 패턴
+                분석 (8차원)
+              </div>
+              <p class="text-slate-600">
+                MTEXT 내부 텍스트를 파싱하여 관경(Ø50), 전기스펙(220V),
+                건축실명(거실), 스프링클러 사양(K-80) 등 8가지 핵심 카테고리
+                매칭 비율 계산 (오탐 방지를 위한 부정 전방탐색 정규식 적용)
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <!-- Section 3 -->
+        <section>
+          <h2
+            class="text-xl font-bold text-slate-900 border-b border-slate-200 pb-2 mb-6"
+          >
+            3. 출력 데이터 및 Fallback 명세
+          </h2>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div class="border border-slate-200 p-5 bg-white">
+              <div
+                class="text-xs text-slate-500 font-bold mb-1 uppercase tracking-wider"
+              >
+                Single Domain
+              </div>
+              <div class="font-bold text-slate-800 mb-2">단일 도메인 반환</div>
+              <p class="text-sm text-slate-600">
+                <code class="font-mono bg-slate-100 px-1 text-slate-700"
+                  >predict()</code
+                >
+                호출 시 최종 판별된 도메인 문자열 반환
+                <span class="text-slate-400">(예: "elec")</span>
+              </p>
+            </div>
+            <div class="border border-slate-200 p-5 bg-white">
+              <div
+                class="text-xs text-slate-500 font-bold mb-1 uppercase tracking-wider"
+              >
+                Probability Distribution
+              </div>
+              <div class="font-bold text-slate-800 mb-2">확률 분포 반환</div>
+              <p class="text-sm text-slate-600">
+                <code class="font-mono bg-slate-100 px-1 text-slate-700"
+                  >predict_proba()</code
+                >
+                호출 시 각 도메인별 신뢰도 딕셔너리 반환
+                <span class="text-slate-400"
+                  >({"arch": 0.05, "elec": 0.82, "fire": 0.08, "pipe":
+                  0.05})</span
+                >
+              </p>
+            </div>
+            <div class="border border-slate-200 p-5 bg-white">
+              <div
+                class="text-xs text-slate-500 font-bold mb-1 uppercase tracking-wider"
+              >
+                Batch Processing
+              </div>
+              <div class="font-bold text-slate-800 mb-2">배치 처리</div>
+              <p class="text-sm text-slate-600">
+                <code class="font-mono bg-slate-100 px-1 text-slate-700"
+                  >predict_batch()</code
+                >를 통해 복수 도면 동시 처리 지원
+                <span class="text-slate-400">(numpy.stack 병렬 연산)</span>
+              </p>
+            </div>
+            <div class="border border-slate-300 p-5 bg-slate-50">
+              <div
+                class="text-xs text-slate-600 font-bold mb-1 uppercase tracking-wider"
+              >
+                Safety Net
+              </div>
+              <div class="font-bold text-slate-800 mb-2">
+                안전망 (Fallback) 로직
+              </div>
+              <p class="text-sm text-slate-600">
+                모델 파일 누락, 패키지 충돌, 피처 추출 중 심각한 예외 발생 시
+                서비스 중단을 막기 위해 기본값인 <strong>"arch"</strong>를
+                반환하고 WARNING 로그를 남기도록 설계되었습니다.
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <!-- Section 4 -->
+        <section class="page-break-before">
+          <div
+            class="flex justify-between items-end border-b border-slate-200 pb-2 mb-6"
+          >
+            <h2 class="text-xl font-bold text-slate-900">
+              4. 최종 모델 성능 평가
+            </h2>
+            <span class="text-sm text-slate-500">Test Set: 131개 기준</span>
+          </div>
+          <p class="text-sm text-slate-600 mb-6">
+            다출처 도면 <strong class="text-slate-800">435개 데이터셋</strong>을
+            기준으로 한 성능 지표입니다.
+          </p>
+
+          <div
+            class="grid grid-cols-1 sm:grid-cols-3 gap-0 border-y border-slate-200 mb-8 bg-slate-50 divide-y sm:divide-y-0 sm:divide-x divide-slate-200"
+          >
+            <div class="p-6 text-center">
+              <div
+                class="text-slate-500 text-xs font-bold uppercase tracking-wider mb-2"
+              >
+                Test Macro F1
+              </div>
+              <div class="text-3xl font-light text-slate-900">0.8074</div>
+              <div class="text-xs text-slate-500 mt-2">
+                클래스 불균형 고려 (1위)
+              </div>
+            </div>
+            <div class="p-6 text-center bg-white">
+              <div
+                class="text-slate-500 text-xs font-bold uppercase tracking-wider mb-2"
+              >
+                Test Accuracy
+              </div>
+              <div class="text-3xl font-light text-slate-900">0.8168</div>
+            </div>
+            <div class="p-6 text-center bg-white">
+              <div
+                class="text-slate-500 text-xs font-bold uppercase tracking-wider mb-2"
+              >
+                CV ROC-AUC (OvR)
+              </div>
+              <div class="text-3xl font-light text-slate-900">0.9494</div>
+              <div class="text-xs text-slate-500 mt-2">
+                정답이 2순위 확률에 근접
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <h3
+              class="font-bold text-slate-800 mb-4 text-sm uppercase tracking-wider"
+            >
+              도메인별 세부 성능
+              <span class="text-slate-400 font-normal lowercase"
+                >(CV F1 기준)</span
+              >
+            </h3>
+            <table class="w-full text-sm text-left border-t border-slate-200">
+              <tbody class="divide-y divide-slate-100">
+                <tr class="hover:bg-slate-50 transition-colors">
+                  <td class="py-3 pr-4 font-bold text-slate-800 w-24">
+                    배관
+                    <span class="text-slate-400 font-normal text-xs"
+                      >(pipe)</span
+                    >
+                  </td>
+                  <td class="py-3 px-4 font-mono text-slate-900 w-20">
+                    0.8681
+                  </td>
+                  <td class="py-3 px-4 text-slate-600">
+                    관경 패턴 및 재질 키워드 신호가 강해 최고 성능
+                  </td>
+                </tr>
+                <tr class="hover:bg-slate-50 transition-colors">
+                  <td class="py-3 pr-4 font-bold text-slate-800 w-24">
+                    전기
+                    <span class="text-slate-400 font-normal text-xs"
+                      >(elec)</span
+                    >
+                  </td>
+                  <td class="py-3 px-4 font-mono text-slate-900 w-20">
+                    0.8462
+                  </td>
+                  <td class="py-3 px-4 text-slate-600">
+                    전압/전선 정규식 및 색상 다양성 신호 우수
+                  </td>
+                </tr>
+                <tr class="hover:bg-slate-50 transition-colors">
+                  <td class="py-3 pr-4 font-bold text-slate-800 w-24">
+                    건축
+                    <span class="text-slate-400 font-normal text-xs"
+                      >(arch)</span
+                    >
+                  </td>
+                  <td class="py-3 px-4 font-mono text-slate-900 w-20">
+                    0.7956
+                  </td>
+                  <td class="py-3 px-4 text-slate-600">
+                    도면 종류 변동성이 크나 층고/실명 패턴으로 선방
+                  </td>
+                </tr>
+                <tr class="hover:bg-slate-50 transition-colors">
+                  <td class="py-3 pr-4 font-bold text-slate-800 w-24">
+                    소방
+                    <span class="text-slate-400 font-normal text-xs"
+                      >(fire)</span
+                    >
+                  </td>
+                  <td class="py-3 px-4 font-mono text-slate-900 w-20">
+                    0.6982
+                  </td>
+                  <td class="py-3 px-4 text-slate-600">
+                    배관과 ARC/CIRCLE 기하를 강하게 공유하여 구별 난이도 높음
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- Section 5 -->
+        <section>
+          <h2
+            class="text-xl font-bold text-slate-900 border-b border-slate-200 pb-2 mb-6"
+          >
+            5. 배포 스펙 및 운영 환경
+          </h2>
+          <div
+            class="border border-slate-200 rounded-sm divide-y divide-slate-200 bg-white text-sm"
+          >
+            <div class="flex flex-col sm:flex-row sm:items-center p-4">
+              <div class="font-bold text-slate-800 sm:w-1/4 mb-2 sm:mb-0">
+                필요 라이브러리
+              </div>
+              <div class="sm:w-3/4 flex flex-wrap gap-2 text-xs">
+                <span class="bg-slate-100 text-slate-700 px-2 py-1 font-mono"
+                  >scikit-learn==1.8.0</span
+                >
+                <span class="bg-slate-100 text-slate-700 px-2 py-1 font-mono"
+                  >catboost==1.2.10</span
+                >
+                <span class="bg-slate-100 text-slate-700 px-2 py-1 font-mono"
+                  >numpy>=1.26</span
+                >
+                <span class="bg-slate-100 text-slate-700 px-2 py-1 font-mono"
+                  >joblib</span
+                >
+              </div>
+            </div>
+            <div class="flex flex-col sm:flex-row sm:items-center p-4">
+              <div class="font-bold text-slate-800 sm:w-1/4 mb-2 sm:mb-0">
+                추론 스펙
+              </div>
+              <div class="sm:w-3/4 text-slate-600">
+                GPU가 불필요하며, CPU 환경에서 단일 샘플당 피처 추출 포함
+                <strong class="text-slate-900 font-mono">&lt; 10ms</strong>
+                이내의 고속 추론 보장
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Section 6 -->
+        <section>
+          <h2
+            class="text-xl font-bold text-slate-900 border-b border-slate-200 pb-2 mb-6"
+          >
+            6. 향후 고도화 및 개선 방향
+          </h2>
+          <ul
+            class="space-y-4 text-sm text-slate-700 list-decimal list-inside pl-2 marker:font-bold marker:text-slate-500"
+          >
+            <li class="pl-2">
+              <span class="font-bold text-slate-900">소방 도면 한계 극복:</span>
+              소방 성능(F1 0.69) 개선을 위해 텍스트 주석이 없는 도면에서도
+              구별할 수 있도록 '블록 삽입점 간의 간격 분포' 같은 세밀한 기하
+              피처 연구 및 소방 데이터 150개 이상 추가 확보.
+            </li>
+            <li class="pl-2">
+              <span class="font-bold text-slate-900">데이터 한계 돌파:</span>
+              현재 N=435 규모의 데이터를 1,000개 이상으로 다출처 구축할 경우
+              Test Macro F1 0.85 이상 달성 예상.
+            </li>
+            <li class="pl-2">
+              <span class="font-bold text-slate-900"
+                >Human-in-the-Loop 적용:</span
+              >
+              <code class="font-mono bg-slate-100 px-1 text-slate-600"
+                >predict_proba()</code
+              >
+              결과 중 최댓값이 0.6 미만인 '경계선상 도면(예: 배관/소방 혼합)'의
+              경우, 에이전트가 단독 결정하지 않고 사용자에게 도메인 선택 UI를
+              노출하여 정확도를 끌어올리는 사용자 개입 시스템 도입 예정.
+            </li>
+          </ul>
+        </section>
+      </div>
+    </div>
+  </body>
+</html>

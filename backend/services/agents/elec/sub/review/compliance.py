@@ -3,7 +3,6 @@ File    : backend/services/agents/electric/sub/review/compliance.py
 Author  : 김지우
 Date    : 2026-04-23
 Description : 전기 시방서 기반 설비 배치 정합성 검증 에이전트 (RAG + LLM)
-              [환각 방지] 엄격한 8계명 및 proposed_action (Auto-Fix) 스키마 적용
 """
 
 import asyncio
@@ -205,6 +204,8 @@ current_value / required_value 는 빈 문자열 대신 실제 수치·단위를
       "current_value":  "현재 도면 수치 (예: 2.5SQ, 220V, 500mm)",
       "required_value": "규정 요구 수치 (예: 4.0SQ, 380V, 500mm 이상)",
       "reason":         "논리적 위반 사유 요약 (한국어)",
+      "confidence_score":  "0.0~1.0 사이 신뢰도. RAG 근거와 도면 수치가 모두 명확할 때만 0.7 이상",
+      "confidence_reason": "신뢰도 근거 짧은 키워드 (예: rag_reference,value_pair,topology_supported)",
       "proposed_action": {{
         "type": "CHANGE_CABLE_SIZE | CHANGE_COLOR | CHANGE_BREAKER_CAPACITY | LAYER | CREATE_ENTITY | BLOCK_REPLACE (아래 규칙에 따라 선택)",
         "required_size":  "CHANGE_CABLE_SIZE 타입 시: 목표 굵기 (예: 4.0SQ)",
@@ -299,6 +300,112 @@ def _validate_violations(violations: list) -> list:
     return clean
 
 
+def _handle_to_element(parsed: dict) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for el in (parsed or {}).get("elements") or []:
+        if not isinstance(el, dict):
+            continue
+        for key in ("handle", "id", "object_id", "equipment_id"):
+            value = el.get(key)
+            if value:
+                out[str(value)] = el
+    return out
+
+
+_WIRE_VIOLATION_TYPES_FOR_TEXT: frozenset[str] = frozenset({
+    "grounding_wire_error",
+    "cable_ampacity_error",
+    "voltage_drop_error",
+    "conduit_size_error",
+    "undersized_cable",
+})
+
+
+def _filter_text_entity_violations(violations: list, handle_to_el: dict[str, dict]) -> list:
+    """TEXT/MTEXT 엔티티를 대상으로 생성된 전선 관련 위반을 제거한다.
+
+    전선 굵기·전압강하·접지선 위반은 TEXT 객체에 적용될 수 없으므로 오탐으로 판정한다.
+    """
+    clean: list = []
+    for v in violations or []:
+        if not isinstance(v, dict):
+            continue
+        vtype = str(v.get("violation_type") or "")
+        if vtype in _WIRE_VIOLATION_TYPES_FOR_TEXT:
+            oid = str(v.get("equipment_id") or v.get("object_id") or "")
+            el = handle_to_el.get(oid)
+            if el and str(el.get("raw_type") or el.get("type") or "").upper() in {"TEXT", "MTEXT"}:
+                logging.info(
+                    "[ComplianceAgent] TEXT 엔티티 오탐 제거 — handle=%s violation_type=%s",
+                    oid, vtype,
+                )
+                continue
+        clean.append(v)
+    return clean
+
+
+def _compute_confidence_score(v: dict, handle_to_el: dict[str, dict]) -> tuple[float, str]:
+    score = 0.45
+    reasons: list[str] = []
+
+    equipment_id = str(v.get("equipment_id") or v.get("object_id") or "").strip()
+    if equipment_id and equipment_id in handle_to_el:
+        score += 0.15
+        reasons.append("handle_match")
+    elif equipment_id:
+        score += 0.05
+        reasons.append("handle_present")
+
+    if str(v.get("reference_rule") or v.get("legal_reference") or "").strip():
+        score += 0.15
+        reasons.append("rag_reference")
+    else:
+        reasons.append("missing_reference")
+
+    current = str(v.get("current_value") or "").strip()
+    required = str(v.get("required_value") or "").strip()
+    if current and required:
+        score += 0.12
+        reasons.append("value_pair")
+    if set(_NUM_RE.findall(current)) or set(_NUM_RE.findall(required)):
+        score += 0.08
+        reasons.append("numeric_evidence")
+
+    if isinstance(v.get("proposed_action"), dict):
+        score += 0.05
+        reasons.append("action_structured")
+
+    vtype = str(v.get("violation_type") or "")
+    if vtype in {"open_circuit_error", "device_not_connected"} and equipment_id:
+        score += 0.08
+        reasons.append("topology_supported")
+
+    weak_blob = f"{current} {required} {v.get('reason') or ''}"
+    if re.search(r"0(?:\.0+)?\s*(?:SQ|㎟|mm2|mm²)|데이터\s*부족|불명확|확인\s*불가", weak_blob, re.IGNORECASE):
+        score -= 0.25
+        reasons.append("weak_or_missing_data")
+
+    return round(max(0.0, min(1.0, score)), 3), ",".join(reasons)
+
+
+def _inject_confidence(violations: list, handle_to_el: dict[str, dict]) -> list:
+    out: list = []
+    for v in violations or []:
+        if not isinstance(v, dict):
+            continue
+        provided = v.get("confidence_score")
+        try:
+            score = float(provided)
+            v["confidence_score"] = round(max(0.0, min(1.0, score)), 3)
+            v.setdefault("confidence_reason", "llm_self_assessed")
+        except (TypeError, ValueError):
+            score, reason = _compute_confidence_score(v, handle_to_el)
+            v["confidence_score"] = score
+            v["confidence_reason"] = reason
+        out.append(v)
+    return out
+
+
 def _split_elements_by_json_size(elements: list) -> list[list]:
     if not elements: return []
     chunks: list[list] = []
@@ -318,7 +425,7 @@ def _split_elements_by_json_size(elements: list) -> list[list]:
 
 class ComplianceAgent:
     async def check_compliance_parsed(
-        self, target_id: str, spec_context: str, parsed: dict
+        self, target_id: str, spec_context: str, parsed: dict, *, candidates_hint: str = ""
     ) -> list:
         if not (spec_context or "").strip():
             logging.warning("[ComplianceAgent] spec_context 비어 있음 — 빈 violations 반환")
@@ -326,6 +433,7 @@ class ComplianceAgent:
         elements = (parsed or {}).get("elements") or []
         if not elements:
             return []
+        handle_to_el = _handle_to_element(parsed)
 
         # ── LLM 전송 전 경량화: 기하 좌표·내부 메타 제거, attributes 필터링 ────
         slim = _slim_parsed_for_llm(parsed)
@@ -342,8 +450,15 @@ class ComplianceAgent:
         lay_n  = len(layout_str)
 
         if lay_n <= _MAX_LAYOUT_DATA_CHARS and spec_n <= _MAX_SPEC_CONTEXT_CHARS and (lay_n + spec_n) < 70_000:
-            result = await self.check_compliance(target_id, spec_context, layout_str)
-            return _validate_violations(result)
+            result = await self.check_compliance(
+                target_id,
+                spec_context,
+                layout_str,
+                extra_user_suffix=candidates_hint,
+            )
+            result = _validate_violations(_dedupe_violations(result))
+            result = _filter_text_entity_violations(result, handle_to_el)
+            return _inject_confidence(result, handle_to_el)
 
         # 청크 분할도 slim된 elements 기준으로 수행
         parts = _split_elements_by_json_size(slim_elements)
@@ -366,7 +481,12 @@ class ComplianceAgent:
                 if (target_id or "") == "ALL" and el_chunk:
                     t_id = (el_chunk[0].get("id") if isinstance(el_chunk[0], dict) else None) or target_id
                 info = f"\n(검토 구간: {k + 1}/{total} 청크)"
-                return await self.check_compliance(t_id, spec_context, sub_str, extra_user_suffix=info)
+                return await self.check_compliance(
+                    t_id,
+                    spec_context,
+                    sub_str,
+                    extra_user_suffix=candidates_hint + info,
+                )
 
         chunk_results = await asyncio.gather(
             *(_one(k, parts[k]) for k in range(total)), return_exceptions=True
@@ -375,7 +495,9 @@ class ComplianceAgent:
         for r in chunk_results:
             if isinstance(r, list):
                 merged.extend(r)
-        return _validate_violations(_dedupe_violations(merged))
+        merged = _validate_violations(_dedupe_violations(merged))
+        merged = _filter_text_entity_violations(merged, handle_to_el)
+        return _inject_confidence(merged, handle_to_el)
 
     async def check_compliance(
         self, target_id: str, spec_context: str, layout_data: str, *, extra_user_suffix: str = ""

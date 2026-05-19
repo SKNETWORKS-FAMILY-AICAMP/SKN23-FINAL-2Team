@@ -494,6 +494,56 @@ namespace CadSllmAgent.Extraction
             return result;
         }
 
+        /// <summary>전체 추출 (DrawingRevisionTracker 용 wrapper)</summary>
+        /// LockDocument 범위 안에서 호출되므로 MdiActiveDocument == doc 이 보장되나
+        /// 명시적으로 doc 을 검증해 잘못된 컨텍스트에서의 호출을 조기 감지한다.
+        public static CadDrawingData ExtractFull(Document doc)
+        {
+            if (doc == null) throw new ArgumentNullException(nameof(doc));
+            if (!ReferenceEquals(doc, AcApp.DocumentManager.MdiActiveDocument))
+                throw new InvalidOperationException(
+                    "[CadDataExtractor] ExtractFull: doc is not MdiActiveDocument. " +
+                    "Call from within LockDocument + ExecuteInApplicationContext.");
+            return Extract();
+        }
+
+        /// <summary>지정된 handle 집합에 해당하는 엔티티만 추출</summary>
+        public static List<CadEntity> ExtractByHandles(Document doc, HashSet<string> handles)
+        {
+            if (handles.Count == 0) return new List<CadEntity>();
+
+            var result = new List<CadEntity>();
+            using var tr = doc.Database.TransactionManager.StartTransaction();
+
+            foreach (var handleStr in handles)
+            {
+                if (string.IsNullOrWhiteSpace(handleStr)) continue;
+
+                try
+                {
+                    if (!long.TryParse(handleStr, System.Globalization.NumberStyles.HexNumber, null, out var h))
+                        continue;
+
+                    var objId = doc.Database.GetObjectId(false, new Handle(h), 0);
+                    if (objId.IsNull) continue;
+
+                    if (tr.GetObject(objId, OpenMode.ForRead, false) is Entity ent)
+                    {
+                        var cadEnt = BuildCadEntity(tr, ent);
+                        if (cadEnt != null)
+                            result.Add(cadEnt);
+                    }
+                }
+                catch
+                {
+                    // 삭제되었거나 현재 DB에서 찾을 수 없는 handle은 delta의 erased/dirty 정보로 처리된다.
+                }
+            }
+
+            tr.Commit();
+            return result;
+        }
+
         public static string ToJson(CadDrawingData data) =>
             JsonSerializer.Serialize(data, new JsonSerializerOptions
             {
@@ -533,6 +583,12 @@ namespace CadSllmAgent.Extraction
                     break;
                 case Polyline pl:
                     FillPolyline(cadEnt, pl);
+                    break;
+                case Polyline2d pl2d:
+                    FillPolyline2d(tr, cadEnt, pl2d);
+                    break;
+                case Polyline3d pl3d:
+                    FillPolyline3d(tr, cadEnt, pl3d);
                     break;
                 case Spline spline:
                     FillSpline(cadEnt, spline);
@@ -591,6 +647,8 @@ namespace CadSllmAgent.Extraction
         private static void FillArc(CadEntity c, Arc a)
         {
             c.Center = Pt(a.Center);
+            c.Start = Pt(a.StartPoint);
+            c.End = Pt(a.EndPoint);
             c.Radius = Math.Round(a.Radius, 4);
             c.StartAngle = Math.Round(a.StartAngle * 180.0 / Math.PI, 4);
             c.EndAngle = Math.Round(a.EndAngle * 180.0 / Math.PI, 4);
@@ -615,10 +673,75 @@ namespace CadSllmAgent.Extraction
             }
             c.Vertices = verts;
             c.IsClosed = pl.Closed;
-            try { c.Perimeter = Math.Round(pl.Length, 4); } catch { }
+            try
+            {
+                var length = Math.Round(pl.Length, 4);
+                c.Length = length;
+                c.Perimeter = length;
+            }
+            catch { }
             try { if (pl.Closed) c.Area = Math.Round(pl.Area, 4); } catch { }
             if (pl.ConstantWidth > 0)
                 c.ConstantWidth = Math.Round(pl.ConstantWidth, 4);
+        }
+
+        private static void FillPolyline2d(Transaction tr, CadEntity c, Polyline2d pl)
+        {
+            var verts = new List<CadVertex>();
+            foreach (ObjectId vertexId in pl)
+            {
+                if (tr.GetObject(vertexId, OpenMode.ForRead) is not Vertex2d v)
+                    continue;
+
+                var p = v.Position;
+                double bulge = 0;
+                try { bulge = v.Bulge; } catch { }
+                verts.Add(new CadVertex
+                {
+                    X = Math.Round(p.X, 4),
+                    Y = Math.Round(p.Y, 4),
+                    Bulge = Math.Round(bulge, 6)
+                });
+            }
+
+            c.Vertices = verts;
+            c.IsClosed = pl.Closed;
+            FillCurveLength(c, pl);
+        }
+
+        private static void FillPolyline3d(Transaction tr, CadEntity c, Polyline3d pl)
+        {
+            var verts = new List<CadVertex>();
+            foreach (ObjectId vertexId in pl)
+            {
+                if (tr.GetObject(vertexId, OpenMode.ForRead) is not PolylineVertex3d v)
+                    continue;
+
+                var p = v.Position;
+                verts.Add(new CadVertex
+                {
+                    X = Math.Round(p.X, 4),
+                    Y = Math.Round(p.Y, 4),
+                    Bulge = 0
+                });
+            }
+
+            c.Vertices = verts;
+            c.IsClosed = pl.Closed;
+            FillCurveLength(c, pl);
+        }
+
+        private static void FillCurveLength(CadEntity c, Curve curve)
+        {
+            try
+            {
+                var length = curve.GetDistanceAtParameter(curve.EndParam)
+                             - curve.GetDistanceAtParameter(curve.StartParam);
+                length = Math.Round(Math.Abs(length), 4);
+                c.Length = length;
+                c.Perimeter = length;
+            }
+            catch { }
         }
 
         private static void FillSpline(CadEntity c, Spline sp)
@@ -648,7 +771,8 @@ namespace CadSllmAgent.Extraction
 
         private static void FillBlock(Transaction tr, CadEntity c, BlockReference bref)
         {
-            c.BlockName = bref.Name;
+            c.BlockName    = bref.Name;
+            c.EffectiveName = GetEffectiveBlockName(tr, bref); // 동적 블록 *U123 에서 실제 이름 복원
             c.InsertPoint = new CadPoint
             {
                 X = Math.Round(bref.Position.X, 4),
@@ -659,6 +783,39 @@ namespace CadSllmAgent.Extraction
             c.ScaleY = Math.Round(bref.ScaleFactors.Y, 6);
             c.ScaleZ = Math.Round(bref.ScaleFactors.Z, 6);
             c.Attributes = ExtractAttributes(tr, bref);
+        }
+
+        /// <summary>
+        /// 동적 블록(Dynamic Block)의 실제 이름을 반환합니다.
+        /// bref.Name이 *U123인 경우 DynamicBlockTableRecord를 통해 원본 블록명(E-LIGHT-LED 등)을 얻습니다.
+        /// 일반 블록이거나 실패 시 bref.Name을 그대로 반환합니다.
+        /// </summary>
+        private static string GetEffectiveBlockName(Transaction tr, BlockReference bref)
+        {
+            try
+            {
+                if (bref.IsDynamicBlock)
+                {
+                    var dynBtr = tr.GetObject(
+                        bref.DynamicBlockTableRecord,
+                        OpenMode.ForRead
+                    ) as BlockTableRecord;
+
+                    if (dynBtr != null && !string.IsNullOrWhiteSpace(dynBtr.Name))
+                        return dynBtr.Name;
+                }
+
+                var btr = tr.GetObject(
+                    bref.BlockTableRecord,
+                    OpenMode.ForRead
+                ) as BlockTableRecord;
+
+                return btr?.Name ?? bref.Name;
+            }
+            catch
+            {
+                return bref.Name; // 에러 시 원시명 폔백
+            }
         }
 
         private static void FillMText(CadEntity c, MText mt)
@@ -804,7 +961,24 @@ namespace CadSllmAgent.Extraction
                     Y2 = Math.Round(ext.MaxPoint.Y, 4),
                 };
             }
-            catch { return null; }
+            catch
+            {
+                if (ent is BlockReference bref)
+                {
+                    // Newly appended blocks can have no cached extents until AutoCAD regenerates.
+                    // Keep them in incremental deltas by falling back to the insertion point.
+                    const double pad = 1.0;
+                    var p = bref.Position;
+                    return new CadBBox
+                    {
+                        X1 = Math.Round(p.X - pad, 4),
+                        Y1 = Math.Round(p.Y - pad, 4),
+                        X2 = Math.Round(p.X + pad, 4),
+                        Y2 = Math.Round(p.Y + pad, 4),
+                    };
+                }
+                return null;
+            }
         }
 
         private static Dictionary<string, string>? ExtractAttributes(Transaction tr, BlockReference bref)

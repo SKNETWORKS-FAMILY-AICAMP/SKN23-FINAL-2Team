@@ -422,7 +422,7 @@ async def load_confirmed_fixes(db: AsyncSession, session_id: str) -> list:
 def _json_or_null(obj: list | dict | None) -> str | None:
     if obj is None:
         return None
-    if isinstance(obj, (list, dict)) and not obj and isinstance(obj, list):
+    if isinstance(obj, list) and not obj:
         return "[]"
     return json.dumps(obj, ensure_ascii=False)
 

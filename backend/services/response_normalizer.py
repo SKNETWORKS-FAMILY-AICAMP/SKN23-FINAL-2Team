@@ -89,7 +89,7 @@ def normalize_arch_violations(
 
     for i, v in enumerate(raw_violations):
         handle = v.get("handle", "")
-        entity = handle_map.get(handle) or (entities[0] if entities else {})
+        entity = handle_map.get(handle) or {}
         if not entity:
             continue
 
@@ -147,7 +147,7 @@ def normalize_elec_violations(
         entity = (
             equip_to_entity.get(equip_id)
             or handle_map.get(equip_id)
-            or (entities[0] if entities else {})
+            or {}
         )
 
         handle = entity.get("handle", equip_id) if entity else equip_id
@@ -208,7 +208,7 @@ def normalize_generic_violations(
             or v.get("id")
             or ""
         )
-        entity = handle_map.get(handle) or (entities[0] if entities else {})
+        entity = handle_map.get(handle) or {}
         handle = handle or (entity.get("handle", f"UNKNOWN_{i}") if entity else f"UNKNOWN_{i}")
 
         # description 후보 필드

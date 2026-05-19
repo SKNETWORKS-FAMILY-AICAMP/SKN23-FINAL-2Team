@@ -8,6 +8,8 @@ Description : 도메인별 agent 실행 요청을 받고 LangGraph review workfl
 import time
 import json
 import logging
+import re
+from uuid import UUID
 from typing import List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
@@ -61,9 +63,88 @@ from backend.services.state_service import (
 )
 from backend.services.evaluation import eval_tracker
 from backend.services.llm_service import generate_answer
+from backend.services.drawing_state_service import DrawingStateService, ConflictError
+from backend.core.redis_client import get_redis_client
+from backend.utils.s3_manager import S3Manager as _S3Manager
 
 router = APIRouter()
 agent_service = AgentService()
+
+REVIEW_BLOCKING_CHANGE_MODES = {
+    "INCREMENTAL_PENDING",
+    "FULL_RESYNC_PENDING",
+    "FULL_RESYNC_RUNNING",
+}
+REVIEW_BLOCKING_STATUSES = {
+    "INCREMENTAL_PENDING",
+    "FULL_RESYNC_PENDING",
+    "FULL_RESYNC_RUNNING",
+}
+
+
+async def _load_drawing_for_review(
+    drawing_id: str, session_id: str
+) -> tuple[dict | None, bool]:
+    """
+    drawing_id 기반으로 최신 도면 로드. Returns (data, is_blocked).
+    is_blocked=True 이면 FULL_RESYNC 진행 중 → 검토 차단.
+    """
+    try:
+        _s3 = _S3Manager()
+        _dss = DrawingStateService(redis=get_redis_client(), s3=_s3)
+        state = await _dss.get_state(drawing_id)
+
+        print(
+            f"[S3_LOAD] drawing_id={drawing_id} status={state.status} change_mode={state.change_mode} "
+            f"snapshot_id={state.current_snapshot_id} delta_count={state.delta_count} delta_size={state.delta_size}"
+        )
+
+        if (
+            state.change_mode in REVIEW_BLOCKING_CHANGE_MODES
+            or state.status in REVIEW_BLOCKING_STATUSES
+        ):
+            print(f"[S3_LOAD] drawing_id={drawing_id} ⛔ BLOCKED — change_mode={state.change_mode}")
+            return None, True
+
+        if state.dirty_count > 0:
+            can_use_committed_deltas = (
+                state.change_mode == "INCREMENTAL_READY"
+                and state.delta_count > 0
+                and bool(state.current_snapshot_path)
+            )
+            if can_use_committed_deltas:
+                print(
+                    f"[S3_LOAD] drawing_id={drawing_id} ⚠ stale dirty_count={state.dirty_count} "
+                    "but INCREMENTAL_READY; using committed snapshot+deltas"
+                )
+            else:
+                print(f"[S3_LOAD] drawing_id={drawing_id} BLOCKED dirty_count={state.dirty_count}")
+                return None, True
+
+        if state.delta_count > 0:
+            try:
+                print(f"[S3_LOAD] drawing_id={drawing_id} delta_count={state.delta_count} → load_merged_drawing 시작")
+                data = await _dss.load_merged_drawing(drawing_id)
+                entity_count = len(data.get("entities") or data.get("elements") or [])
+                print(f"[S3_LOAD] drawing_id={drawing_id} ✅ snapshot+delta merge 완료 entities={entity_count}")
+                return data, False
+            except ConflictError:
+                print(f"[S3_LOAD] drawing_id={drawing_id} ⚠ ConflictError — FULL_RESYNC_PENDING 전환됨")
+                return None, True
+
+        if state.current_snapshot_path:
+            print(f"[S3_LOAD] drawing_id={drawing_id} delta 없음 → snapshot 단독 로드 path={state.current_snapshot_path}")
+            data = await _s3.load_json(state.current_snapshot_path)
+            entity_count = len(data.get("entities") or data.get("elements") or [])
+            print(f"[S3_LOAD] drawing_id={drawing_id} ✅ snapshot 로드 완료 entities={entity_count}")
+            return data, False
+
+        print(f"[S3_LOAD] drawing_id={drawing_id} ❌ snapshot_path 없음 → 로드 실패")
+
+    except Exception as _e:
+        print(f"[S3_LOAD] drawing_id={drawing_id} session_id={session_id} ❌ 예외={_e}")
+
+    return None, False
 
 
 async def cancel_agent_review(session_id: str) -> None:
@@ -93,11 +174,10 @@ try:
     from backend.services.agents.common.domain_classifier.classifier import DomainClassifier as _DC
     _domain_classifier: "_DC | None" = _DC()
     if not _domain_classifier.is_loaded:
-        _domain_classifier = None
-        logging.warning("[agent_api] DomainClassifier 로드 실패 — 조기 분류 비활성화")
+        logging.info("[agent_api] DomainClassifier ML 미로드 — RuleClassifier 전용 조기 분류 사용")
 except Exception as _dc_err:
     _domain_classifier = None
-    logging.warning("[agent_api] DomainClassifier import 실패: %s", _dc_err)
+    logging.info("[agent_api] DomainClassifier 비활성화: %s", _dc_err)
 
 # 도메인 코드 → 한글 (DOMAIN_MISMATCH 메시지·로그용)
 _DOMAIN_KR = {"arch": "건축", "elec": "전기", "fire": "소방", "pipe": "배관"}
@@ -105,10 +185,13 @@ _DOMAIN_KR = {"arch": "건축", "elec": "전기", "fire": "소방", "pipe": "배
 class AgentReviewRequest(BaseModel):
     session_id: str
     cad_cache_id: Optional[str] = None
+    drawing_id: Optional[str] = None    # 신규 추가
+    file_fingerprint: Optional[str] = None  # 파일 변경 감지용 (선택)
     domain: str
     active_object_ids: List[str]
     spec_document_ids: Optional[List[str]] = None
     temp_spec_ids: Optional[List[str]] = None
+    project_id: Optional[UUID] = None
     review_mode: str = "KEC_ONLY"
     user_prompt: Optional[str] = None
     org_id: Optional[str] = None
@@ -179,7 +262,28 @@ async def start_agent_review(
     auth_org_id: str = Depends(get_authenticated_org_id),
 ):
     try:
+        body.session_id = (body.session_id or "").strip()
+        if not body.session_id:
+            raise HTTPException(status_code=400, detail="session_id is required")
+        try:
+            UUID(body.session_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="session_id must be a valid UUID")
+
         _clear_review_cancel(body.session_id)
+
+        # file_fingerprint guard: drawing_id + fingerprint 모두 있으면 Redis 저장값과 비교
+        if body.drawing_id and body.file_fingerprint:
+            _stored_fp = await get_redis_client().get(
+                f"drawing:{body.drawing_id}:fileFingerprint"
+            )
+            if _stored_fp and _stored_fp != body.file_fingerprint:
+                logging.warning(
+                    "[agent/start] file_fingerprint mismatch drawing_id=%s — "
+                    "도면 파일이 변경됐을 수 있습니다. 최신 /cad/analyze 결과를 로드하세요.",
+                    body.drawing_id,
+                )
+
         try:
             state = await load_agent_state(db, body.session_id)
         except ValueError:
@@ -231,15 +335,25 @@ async def start_agent_review(
         else:
             org_id = auth_org_id
 
-        if body.temp_spec_ids:
-            for tid in body.temp_spec_ids:
+        temp_spec_ids = [x for x in (body.temp_spec_ids or []) if x]
+        project_id = str(body.project_id) if body.project_id else None
+        if not temp_spec_ids and project_id and org_id:
+            linked_specs = await document_service.get_project_spec_links(db, org_id, project_id)
+            temp_spec_ids = [
+                str(row.get("temp_document_id") or "")
+                for row in linked_specs
+                if row.get("temp_document_id")
+            ]
+
+        if temp_spec_ids:
+            for tid in temp_spec_ids:
                 doc_org = await document_service.get_temp_document_org(db, tid)
                 if not doc_org:
                     raise HTTPException(status_code=404, detail=f"임시 시방서를 찾을 수 없습니다: {tid}")
                 if doc_org != auth_org_id:
                     raise HTTPException(status_code=403, detail="temp_spec_id가 인증된 org와 일치하지 않습니다.")
 
-        spec_guid = body.temp_spec_ids[0] if body.temp_spec_ids else None
+        spec_guid = temp_spec_ids if temp_spec_ids else None
 
         payload = {
             "session_id": body.session_id,
@@ -250,6 +364,7 @@ async def start_agent_review(
             "review_mode": body.review_mode,
             "org_id": org_id,
             "spec_guid": spec_guid,
+            "project_id": project_id,
             "intent_hint": "review",
             "skip_classification": body.skip_classification,
         }
@@ -271,7 +386,16 @@ async def start_agent_review(
         # skip_classification=True 이면 사용자가 이미 확인한 것 → 검사 생략
         if not body.skip_classification:
             try:
-                _cad_data = await cad_service.get_drawing_data(cad_cache_id)
+                _cad_data = None
+                _early_drawing_id = (body.drawing_id or "").strip()
+                if _early_drawing_id:
+                    _early_data, _early_blocked = await _load_drawing_for_review(
+                        _early_drawing_id, cad_cache_id or body.session_id
+                    )
+                    if not _early_blocked and _early_data:
+                        _cad_data = _early_data
+                if not _cad_data:
+                    _cad_data = await cad_service.get_drawing_data(cad_cache_id)
                 _entities = (
                     (_cad_data.get("entities") or _cad_data.get("elements") or [])
                     if _cad_data else []
@@ -326,6 +450,7 @@ async def start_agent_review(
             job_id=job_id,
             cad_cache_id=cad_cache_id,
             skip_classification=body.skip_classification,
+            drawing_id=body.drawing_id or "",
         )
 
         return AgentReviewResponse(
@@ -333,6 +458,8 @@ async def start_agent_review(
             job_id=job_id,
             message="에이전트 검토가 백그라운드에서 시작되었습니다."
         )
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except Exception as exc:
@@ -365,6 +492,7 @@ async def run_agent_background_task(
     job_id: str,
     cad_cache_id: str | None = None,
     skip_classification: bool = False,
+    drawing_id: str = "",
 ):
     async with SessionLocal() as db:
         try:
@@ -412,9 +540,35 @@ async def run_agent_background_task(
             
             runtime_drawing_data = normalized_payload.get("drawing_data") or {}
             cache_key = cad_cache_id or session_id
-            
+            _drawing_data_source = "payload" if runtime_drawing_data else "none"
+
+            drawing_id_req = (drawing_id or "").strip()
+            if drawing_id_req:
+                _loaded, _blocked = await _load_drawing_for_review(drawing_id_req, cache_key)
+                if _blocked:
+                    await manager.send_to_group(
+                        {
+                            "action": "DRAWING_RESYNC",
+                            "session_id": session_id,
+                            "message": "도면 변경사항 저장 또는 동기화가 진행 중입니다. 완료 후 다시 시도해 주세요.",
+                        },
+                        "ui",
+                    )
+                    return
+                if _loaded:
+                    runtime_drawing_data = _loaded  # payload drawing_data를 최신본으로 override
+                    _drawing_data_source = "s3_snapshot_or_merge"
+
             if not runtime_drawing_data:
                 runtime_drawing_data = await cad_service.get_drawing_data(cache_key)
+                if runtime_drawing_data:
+                    _drawing_data_source = "s3_legacy_cache"
+
+            _entity_count = len(runtime_drawing_data.get("entities") or runtime_drawing_data.get("elements") or [])
+            print(
+                f"[DRAWING_LOAD] session={session_id} drawing_id={drawing_id_req or '(none)'} "
+                f"source={_drawing_data_source} entities={_entity_count}"
+            )
             if _is_review_cancelled(session_id):
                 return
                 
@@ -732,21 +886,22 @@ async def execute_agent(body: AgentExecuteRequest, db: AsyncSession = Depends(ge
         await save_agent_state(db, body.session_id, state)
         await cad_service.delete_focus_drawing(str(body.session_id))
 
+        _review_result = state.get("review_result") or {}
         return AgentExecuteResponse(
             status="success",
             message=f"{body.domain} agent graph executed successfully",
             data={
                 "session_id": body.session_id,
-                "domain": result["domain"],
-                "current_step": state["current_step"],
-                "active_object_ids": state["active_object_ids"],
-                "referenced_laws": state["review_result"]["referenced_laws"],
-                "review_result": state["review_result"],
+                "domain": result.get("domain", body.domain),
+                "current_step": state.get("current_step", ""),
+                "active_object_ids": state.get("active_object_ids", []),
+                "referenced_laws": _review_result.get("referenced_laws", []),
+                "review_result": _review_result,
                 "pending_fixes": state.get("pending_fixes", []),
                 "response_meta": state.get("response_meta")
                 or result.get("response_meta")
                 or {},
-                "received_payload": result["received_payload"],
+                "received_payload": result.get("received_payload", {}),
             },
         )
     except ValueError as exc:
@@ -834,13 +989,128 @@ def _bbox_from_entity(ent: dict) -> dict | None:
     return None
 
 
+def _is_drawing_quality_violation_for_cad(v: dict) -> bool:
+    source = str(v.get("_source") or v.get("source") or "")
+    kind = str(v.get("violation_type") or v.get("issue_type") or "")
+    return source == "drawing_qa" or kind.startswith("drawing_quality_")
+
+
+def _point_xy_for_bbox(point: object) -> tuple[float, float] | None:
+    if isinstance(point, dict):
+        try:
+            return float(point.get("x")), float(point.get("y"))
+        except (TypeError, ValueError):
+            return None
+    if isinstance(point, (list, tuple)) and len(point) >= 2:
+        try:
+            return float(point[0]), float(point[1])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _bbox_from_points_for_cad(points: list[tuple[float, float]], pad: float = 50.0) -> dict | None:
+    if not points:
+        return None
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    return {
+        "x1": min(xs) - pad,
+        "y1": min(ys) - pad,
+        "x2": max(xs) + pad,
+        "y2": max(ys) + pad,
+    }
+
+
+def _bbox_from_violation_geometry(v: dict, fix: dict | None) -> dict | None:
+    sources: list[dict] = []
+    pa = v.get("proposed_action")
+    if isinstance(pa, dict):
+        sources.append(pa)
+    proposed_fix = (fix or {}).get("proposed_fix")
+    if isinstance(proposed_fix, dict):
+        sources.append(proposed_fix)
+
+    for source in sources:
+        for a_key, b_key in (
+            ("cloud_from", "cloud_to"),
+            ("touch_point", "overshoot_end"),
+            ("new_start", "new_end"),
+            ("new_center", "new_center"),
+        ):
+            pts = [
+                p
+                for p in (
+                    _point_xy_for_bbox(source.get(a_key)),
+                    _point_xy_for_bbox(source.get(b_key)),
+                )
+                if p is not None
+            ]
+            bbox = _bbox_from_points_for_cad(pts)
+            if bbox:
+                return bbox
+        vertices = source.get("new_vertices")
+        if isinstance(vertices, list):
+            pts = [p for p in (_point_xy_for_bbox(x) for x in vertices) if p is not None]
+            bbox = _bbox_from_points_for_cad(pts)
+            if bbox:
+                return bbox
+    return None
+
+
+def _iter_key_values(value: object):
+    if value is None or value == "":
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield item
+    else:
+        yield value
+
+
+def _candidate_entity_keys(v: dict, fix: dict | None) -> list[str]:
+    raw_values: list[object] = [
+        v.get("object_id"),
+        v.get("equipment_id"),
+        (fix or {}).get("equipment_id"),
+        (fix or {}).get("handle"),
+    ]
+
+    for source in (v, fix or {}):
+        raw_values.extend(_iter_key_values(source.get("related_handles")) or [])
+        raw_values.append(source.get("display_object_id"))
+
+    for source in (v.get("proposed_action"), (fix or {}).get("proposed_fix")):
+        if not isinstance(source, dict):
+            continue
+        for key in ("target_handle", "handle", "equipment_id"):
+            raw_values.append(source.get(key))
+        for key in ("target_handles", "related_handles", "symbol_cluster_handles"):
+            raw_values.extend(_iter_key_values(source.get(key)) or [])
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        for value in _iter_key_values(raw) or []:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            parts = [text]
+            if "<->" in text or "," in text or ";" in text or " " in text:
+                parts.extend(p for p in re.split(r"<->|[,;\s]+", text) if p)
+            for part in parts:
+                key = str(part or "").strip()
+                if key and key not in seen:
+                    seen.add(key)
+                    candidates.append(key)
+    return candidates
+
+
 def _resolve_entity_for_violation(
     v: dict, fix: dict, entities: list, entity_by: dict
 ) -> dict:
-    for raw in (v.get("object_id"), (fix or {}).get("equipment_id"), (fix or {}).get("handle")):
-        if raw is None or raw == "":
-            continue
-        e = _entity_by_object_id(str(raw), entities, entity_by)
+    for raw in _candidate_entity_keys(v, fix):
+        e = _entity_by_object_id(raw, entities, entity_by)
         if e:
             return e
     return {}
@@ -882,13 +1152,38 @@ async def _send_review_websocket(session_id: str, state: dict, reply: str) -> No
                 entity_by[key] = ent
 
     fix_by_equip: dict = {}
+    fix_by_pair: dict[tuple[str, str], dict] = {}
+    fix_by_group: dict[str, dict] = {}
+
+    def _index_fix_key(key: object, fix: dict) -> None:
+        key_s = str(key or "").strip()
+        if key_s:
+            fix_by_equip.setdefault(key_s, fix)
+
     for f in pending_fixes or []:
         if not isinstance(f, dict):
             continue
-        eq = f.get("equipment_id")
-        if eq is None or str(eq).strip() == "":
-            continue
-        fix_by_equip[str(eq).strip()] = f
+        eq = str(f.get("equipment_id") or "").strip()
+        vtype = str(f.get("violation_type") or "").strip()
+        group = str(f.get("group_id") or "").strip()
+        if eq and vtype:
+            fix_by_pair.setdefault((eq, vtype), f)
+        if group:
+            fix_by_group.setdefault(group, f)
+        _index_fix_key(eq, f)
+        _index_fix_key(f.get("handle"), f)
+        _index_fix_key(f.get("display_object_id"), f)
+        for key in f.get("related_handles") or []:
+            _index_fix_key(key, f)
+        proposed_fix = f.get("proposed_fix") or {}
+        if isinstance(proposed_fix, dict):
+            _index_fix_key(proposed_fix.get("target_handle"), f)
+            for key in proposed_fix.get("target_handles") or []:
+                _index_fix_key(key, f)
+            for key in proposed_fix.get("related_handles") or []:
+                _index_fix_key(key, f)
+            for key in proposed_fix.get("symbol_cluster_handles") or []:
+                _index_fix_key(key, f)
 
     domain_type = (state.get("session_meta") or {}).get("domain_type")
     org_for_role = state.get("org_id")
@@ -902,19 +1197,37 @@ async def _send_review_websocket(session_id: str, state: dict, reply: str) -> No
     ncs_mep = getattr(settings, "NCS_DISCIPLINE_MEP_PREFIX", True)
 
     annotated_entities = []
+    skipped_arch = 0
+    unresolved = 0
+    print(
+        f"[AgentCAD REVIEW] session={session_id} violations={len(violations)} "
+        f"pending={len(pending_fixes)} entities={len(entities)}"
+    )
     for v in violations:
         if not isinstance(v, dict):
             continue
         obj_id = str(v.get("object_id", "") or "").strip()
-        fix = fix_by_equip.get(obj_id) or {}
+        vtype = str(v.get("violation_type", "") or "").strip()
+        group = str(v.get("group_id") or "").strip()
+        fix = (
+            fix_by_group.get(group)
+            or fix_by_pair.get((obj_id, vtype))
+            or fix_by_equip.get(obj_id)
+            or {}
+        )
         ent = _resolve_entity_for_violation(v, fix, entities, entity_by)
+        is_drawing_quality = _is_drawing_quality_violation_for_cad(v)
+        if not ent:
+            unresolved += 1
 
         if (
             domain_type == "pipe"
             and isinstance(ent, dict)
             and ent
+            and not is_drawing_quality
             and entity_layer_role(ent, db_layer_roles, ncs_mep_prefix=ncs_mep) == "arch"
         ):
+            skipped_arch += 1
             continue
         
         proposed = fix.get("proposed_fix") or {}
@@ -951,7 +1264,7 @@ async def _send_review_websocket(session_id: str, state: dict, reply: str) -> No
             "violation_type": v.get("violation_type", ""),
             "source":      v.get("_source", "llm"),
             "_source":     v.get("_source", "llm"),
-            "severity":    _severity(v.get("violation_type", "")),
+            "severity":    v.get("severity") or _severity(v.get("violation_type", "")),
             "rule":        v.get("legal_reference", ""),
             "description": v.get("reason", ""),
             "suggestion":  v.get("suggestion", ""),
@@ -962,13 +1275,31 @@ async def _send_review_websocket(session_id: str, state: dict, reply: str) -> No
         }
         if v.get("proposed_action"):
             _violation_dict["proposed_action"] = v["proposed_action"]
+        for extra_key in ("related_handles", "group_id", "display_object_id"):
+            if v.get(extra_key) is not None:
+                _violation_dict[extra_key] = v.get(extra_key)
             
         # handle: 실제 CAD hex 핸들 우선. 엔티티를 못 찾은 경우 obj_id가 fallback이 되어
         # C#에서 Convert.ToInt64(hex, 16) 실패 가능성이 있으므로 가능한 한 실제 handle을 사용.
         _handle = ent.get("handle") or fix.get("handle") or obj_id
 
         # bbox: C# RevCloud/ZoomToEntity 양쪽 모두 null이면 완전히 무기능 → 반드시 채움
-        _bbox = _bbox_from_entity(ent)
+        _bbox = None
+        for stored in (
+            v.get("bbox"),
+            v.get("target_bbox"),
+            (fix.get("proposed_fix") or {}).get("_entity_bbox") if fix else None,
+            fix.get("bbox") if fix else None,
+        ):
+            if isinstance(stored, dict) and all(k in stored for k in ("x1", "y1", "x2", "y2")):
+                _bbox = stored
+                break
+        if _bbox is None and is_drawing_quality:
+            _bbox = _bbox_from_violation_geometry(v, fix)
+        if _bbox is None:
+            _bbox = _bbox_from_entity(ent)
+        if _bbox is None:
+            _bbox = _bbox_from_violation_geometry(v, fix)
 
         annotated_entities.append({
             "handle": _handle,
@@ -977,6 +1308,18 @@ async def _send_review_websocket(session_id: str, state: dict, reply: str) -> No
             "bbox":   _bbox,
             "violation": _violation_dict,
         })
+
+    sample = ""
+    if annotated_entities:
+        first = annotated_entities[0]
+        sample = (
+            f" handle={first.get('handle')} "
+            f"type={(first.get('violation') or {}).get('violation_type')}"
+        )
+    print(
+        f"[AgentCAD REVIEW] annotated={len(annotated_entities)} "
+        f"skipped_arch={skipped_arch} unresolved={unresolved}{sample}"
+    )
 
     payload = {
         "session_id":         session_id,
@@ -991,11 +1334,23 @@ async def _send_review_websocket(session_id: str, state: dict, reply: str) -> No
 
 
 def _severity(violation_type: str) -> str:
-    if violation_type in {"pressure_overload", "fire_penetration_error", "seismic_support_error"}:
+    if violation_type in {
+        "pressure_overload", "fire_penetration_error", "seismic_support_error",
+        "open_circuit_error",               # 미결선 — 전원 미공급
+        "wire_count_violation",             # 1가닥 불가 (Critical 케이스)
+    }:
         return "Critical"
-    if violation_type in {"pipe_size_mismatch", "material_mismatch", "slope_error",
-                          "expansion_joint_missing", "fire_compartment_area",
-                          "exit_distance_error", "voltage_drop_exceeded"}:
+    if violation_type in {
+        "pipe_size_mismatch", "material_mismatch", "slope_error",
+        "expansion_joint_missing", "fire_compartment_area",
+        "exit_distance_error", "voltage_drop_exceeded",
+        "grounding_rod_spacing_violation",  # KEC 140.6 접지봉 이격거리
+        "grounding_rod_count_mismatch",     # 접지봉 수량 부족
+        "breaker_pole_mismatch",            # 차단기 극수 불일치
+        "nonstandard_voltage",              # 비표준 전압
+        "outlet_height_violation",          # KEC 232.56 콘센트 설치 높이
+        "wire_count_violation",             # 배선 가닥 수 불일치
+    }:
         return "Major"
     return "Minor"
 
@@ -1003,7 +1358,8 @@ def _severity(violation_type: str) -> str:
 _CAD_AUTOFIX_TYPES = frozenset(
     "ATTRIBUTE LAYER TEXT_CONTENT TEXT_HEIGHT COLOR LINETYPE LINEWEIGHT "
     "DELETE MOVE ROTATE SCALE GEOMETRY BLOCK_REPLACE DYNAMIC_BLOCK_PARAM "
-    "CREATE_ENTITY CREATE_LINE CREATE_CIRCLE CREATE_POLYLINE CREATE_BLOCK".split()
+    "RECTANGLE_RESIZE STRETCH_RECT "
+    "CREATE_ENTITY CREATE_LINE CREATE_CIRCLE CREATE_POLYLINE CREATE_BLOCK CREATE_TEXT".split()
 )
 
 # ✨ [핵심 수정] proposed_action 을 받아 C#이 이해하는 auto_fix 구조로 정규화
@@ -1018,6 +1374,21 @@ def _resolve_autofix_for_cad(action: str, proposed: dict) -> dict | None:
                 except (TypeError, ValueError):
                     return _to_autofix(action, proposed)
             return out
+
+        # proposed_fix 안에 nested auto_fix 서브딕트가 있으면 우선 사용한다.
+        # (revision.py의 _dispatch 핸들러들이 {"action":..., "auto_fix":{...}} 형태로 반환)
+        nested = proposed.get("auto_fix")
+        if isinstance(nested, dict):
+            nt = str(nested.get("type", "") or "").upper()
+            if nt in _CAD_AUTOFIX_TYPES:
+                out = {**nested, "type": nt}
+                if nt == "COLOR" and out.get("new_color") is not None:
+                    try:
+                        out["new_color"] = int(out["new_color"])
+                    except (TypeError, ValueError):
+                        pass
+                return out
+
     return _to_autofix(action, proposed or {})
 
 
@@ -1075,7 +1446,7 @@ def _to_autofix(action: str, proposed: dict) -> dict | None:
     if a == "REPLACE_MATERIAL":
         return {"type": "ATTRIBUTE", "attribute_tag": "MATERIAL", "new_value": str(proposed.get("required_material", ""))}
     if a == "DELETE":
-        return {"type": "DELETE"}
+        return {"type": "DELETE", "modification_tier": 4}
     if a == "LAYER":
         return {"type": "LAYER", "new_layer": str(proposed.get("new_layer", ""))}
     if a in ("SCALE", "RESIZE"):

@@ -11,20 +11,28 @@
 
 import axios from "axios";
 import { SpecDocument } from "../types/spec";
+import { getDocumentApiHeaders } from "../utils/documentApiAuth";
 
-const API_BASE = "http://localhost:8000/api/v1/docs";
+const API_BASE =
+  ((import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "") ||
+    "http://localhost:8000") + "/api/v1/docs";
 
 export const specApi = {
   // 목록 조회
   fetchList: (projectId: string) =>
-    axios.get<SpecDocument[]>(`${API_BASE}/list?project_id=${projectId}`),
+    axios.get<SpecDocument[]>(`${API_BASE}/list?project_id=${projectId}`, {
+      headers: { ...getDocumentApiHeaders() },
+    }),
 
   // 업로드
   upload: (formData: FormData) =>
     axios.post(`${API_BASE}/upload/temp`, formData, {
-      headers: { "Content-Type": "multipart/form-data" },
+      headers: { "Content-Type": "multipart/form-data", ...getDocumentApiHeaders() },
     }),
 
   // 삭제
-  delete: (ids: string[]) => axios.post(`${API_BASE}/delete`, { ids }),
+  delete: (ids: string[]) =>
+    axios.post(`${API_BASE}/delete`, { ids }, {
+      headers: { ...getDocumentApiHeaders() },
+    }),
 };

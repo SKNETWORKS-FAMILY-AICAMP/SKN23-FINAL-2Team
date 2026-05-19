@@ -10,6 +10,49 @@ from backend.services.agents.fire.sub.review.parser import ParserAgent
 from backend.services.llm_service import generate_answer
 
 
+# ─── LAYER 변경 deterministic extractor ──────────────────────────────────────
+_LAYER_KW_RE = re.compile(r'레이어|도면층|layer', re.IGNORECASE)
+_LAYER_SELECTION_RE = re.compile(r'선택', re.IGNORECASE)  # 선택 객체 언급 여부 — active_ids 없을 때 안내 메시지 분기에 사용
+
+# Phase 1: 명시적 레이어 키워드 있는 경우.
+# "로|으로" 후행 조건으로 "레이어 확인" 같은 false-positive를 방지한다.
+_LAYER_EXPLICIT_PATTERNS = [
+    re.compile(r'(?:레이어|도면층)(?:를|을|는)?\s*([A-Za-z0-9_\-]+)(?:로|으로)', re.IGNORECASE),
+    re.compile(r'([A-Za-z0-9_\-]+)\s*(?:레이어|도면층)(?:로|으로)', re.IGNORECASE),
+    re.compile(r'(?:레이어|도면층)\s*:\s*([A-Za-z0-9_\-]+)', re.IGNORECASE),
+]
+
+# Phase 2: 레이어 키워드 없이 CAD-style 식별자 + 방향 동사.
+# MOVE의 _extract_move_delta()가 먼저 실행되므로 이동 명령은 여기 도달하지 않는다.
+_LAYER_FALLBACK_PATTERN = re.compile(
+    r'\b([A-Z][A-Za-z0-9_\-]{1,})(?:로|으로)\s*(?:바꿔|변경|교체)',
+    re.IGNORECASE,
+)
+
+
+def _extract_layer_change(user_request: str) -> str | None:
+    """사용자 요청에서 레이어명을 추출한다. 없으면 None."""
+    text = (user_request or "").strip()
+    if not text:
+        return None
+    # Phase 1: 레이어 키워드 있는 경우
+    if _LAYER_KW_RE.search(text):
+        for pattern in _LAYER_EXPLICIT_PATTERNS:
+            m = pattern.search(text)
+            if m:
+                candidate = m.group(1).strip()
+                if len(candidate) >= 2:
+                    return candidate
+    # Phase 2: 키워드 없는 fallback
+    m = _LAYER_FALLBACK_PATTERN.search(text)
+    if m:
+        candidate = m.group(1).strip()
+        if len(candidate) >= 2:
+            return candidate
+    return None
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 class ActionAgent:
     def __init__(self):
         self.parser = ParserAgent()
@@ -47,6 +90,49 @@ class ActionAgent:
             selected = all_elements
             surrounding = []
 
+        user_request = (context.get("user_request") or "").strip()
+
+        # ── deterministic LAYER 변경 (selected 필터링과 무관, active_ids 기반) ────────
+        # parser가 active_ids의 entity를 찾지 못해도 active_ids만 있으면 처리한다.
+        layer_name = _extract_layer_change(user_request)
+        layer_kw_present = bool(_LAYER_KW_RE.search(user_request))
+        selection_mentioned = bool(_LAYER_SELECTION_RE.search(user_request))
+
+        if layer_kw_present or selection_mentioned or layer_name is not None:
+            if not active_ids:
+                return {
+                    "analysis": "선택 객체 없음",
+                    "fixes": [],
+                    "message": "선택된 객체가 없습니다. AutoCAD에서 객체를 선택한 뒤 다시 요청해 주세요.",
+                }
+            if layer_name and active_ids:
+                active_ids_ordered = context.get("active_object_ids_ordered") or []
+                handles = [str(x) for x in active_ids_ordered if x] or sorted(active_ids)
+                logging.info(
+                    "[FireActionAgent] deterministic layer change layer=%s handles=%d",
+                    layer_name, len(handles),
+                )
+                return {
+                    "analysis": f"선택 객체 {len(handles)}개 레이어를 [{layer_name}]로 변경합니다.",
+                    "fixes": [{
+                        "handle": handles[0],
+                        "type": "MULTI_LAYER",
+                        "reason": f"사용자 레이어 변경 요청: {user_request}",
+                        "action": "LAYER",
+                        "auto_fix": {
+                            "type": "LAYER",
+                            "new_layer": layer_name,
+                            "target_handles": handles,
+                        },
+                    }],
+                    "message": (
+                        f"선택 객체 {len(handles)}개의 레이어를 [{layer_name}]로 변경합니다. "
+                        "수정 후보를 확인 후 승인해 주세요."
+                    ),
+                }
+        # 레이어명 미추출 또는 active_ids 없음 → LLM 경로로 진행 (selected 필요)
+        # ─────────────────────────────────────────────────────────────────────────
+
         if not selected:
             logging.info(
                 "[FireActionAgent] no selected objects (active_ids=%s, count=%d)",
@@ -59,7 +145,6 @@ class ActionAgent:
                 "message": "수정할 객체를 AutoCAD에서 먼저 선택한 뒤 다시 시도해 주세요.",
             }
 
-        user_request = (context.get("user_request") or "").strip()
         move_delta = _extract_move_delta(user_request)
         if move_delta is not None:
             delta_x, delta_y = move_delta
@@ -161,7 +246,7 @@ class ActionAgent:
             parsed.setdefault("analysis", "분석 완료")
             parsed.setdefault(
                 "message",
-                f"선택 객체 {len(selected)}개 분석 완료. {len(fixes)}개 수정 후보를 생성했습니다.",
+                f"선택하신 {len(selected)}개 객체를 살펴봤고, 적용을 검토할 수정 후보 {len(fixes)}개를 준비했습니다.",
             )
             logging.info(
                 "[FireActionAgent] completed selected=%d fixes=%d",

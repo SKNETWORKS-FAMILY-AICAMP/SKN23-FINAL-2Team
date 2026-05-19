@@ -106,6 +106,8 @@ namespace CadSllmAgent.Models
         [JsonPropertyName("confidence_score")]  public double? ConfidenceScore  { get; set; }
         /// <summary>신뢰도가 낮은 이유 (Python confidence_reason)</summary>
         [JsonPropertyName("confidence_reason")] public string? ConfidenceReason { get; set; }
+        [JsonPropertyName("proposed_action")] public Dictionary<string, JsonElement>? ProposedAction { get; set; }
+        [JsonPropertyName("related_handles")] public List<string>? RelatedHandles { get; set; }
         [JsonPropertyName("auto_fix")]    public AutoFix?    AutoFix     { get; set; }
     }
 
@@ -143,6 +145,14 @@ namespace CadSllmAgent.Models
         // ── LAYER ────────────────────────────────────────────────────
         /// <summary>변경할 레이어명 (LAYER 타입)</summary>
         [JsonPropertyName("new_layer")]     public string? NewLayer     { get; set; }
+
+        // ── LAYER (bulk) ──────────────────────────────────────────────────────
+        /// <summary>
+        /// LAYER type bulk 변경 시 대상 handle 목록.
+        /// null 또는 비어 있으면 단일 handle 경로(기존 ApplyFix)를 사용한다.
+        /// </summary>
+        [JsonPropertyName("target_handles")]
+        public List<string>? TargetHandles { get; set; }
 
         // ── TEXT_CONTENT ─────────────────────────────────────────────
         /// <summary>새 텍스트 내용 (TEXT_CONTENT 타입)</summary>
@@ -206,6 +216,14 @@ namespace CadSllmAgent.Models
         [JsonPropertyName("new_start_angle")] public double? NewStartAngle { get; set; }
         /// <summary>ARC 새 끝 각도 도(°) (GEOMETRY 타입)</summary>
         [JsonPropertyName("new_end_angle")]   public double? NewEndAngle   { get; set; }
+
+        // ── GEOMETRY — ELLIPSE ────────────────────────────────────────
+        /// <summary>ELLIPSE 반장축 길이 (CREATE_ENTITY 타입)</summary>
+        [JsonPropertyName("new_semi_major")] public double? NewSemiMajor { get; set; }
+        /// <summary>ELLIPSE 반단축 길이 (CREATE_ENTITY 타입)</summary>
+        [JsonPropertyName("new_semi_minor")] public double? NewSemiMinor { get; set; }
+        /// <summary>ELLIPSE 회전 각도 도(°) (CREATE_ENTITY 타입)</summary>
+        [JsonPropertyName("new_rotation")]   public double? NewRotation  { get; set; }
 
         // ── GEOMETRY — POLYLINE ───────────────────────────────────────
         /// <summary>POLYLINE 새 꼭짓점 목록 (GEOMETRY 타입)</summary>

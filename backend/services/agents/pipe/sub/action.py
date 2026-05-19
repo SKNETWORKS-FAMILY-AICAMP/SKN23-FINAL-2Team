@@ -20,10 +20,10 @@ from backend.services.llm_service import generate_answer
 
 from backend.services.agents.pipe.sub.review.parser import ParserAgent
 
-# ── DrawCommandParser / 관련 상수·유틸은 elec 패키지에서 재활용 ──────────────
-# elec와 pipe 모두 동일한 DrawCommandParser 로직을 사용한다.
-# 코드 중복을 피하기 위해 elec 모듈에서 직접 import 한다.
-from backend.services.agents.elec.sub.action import (
+# ── Shared CAD direct-command parser ────────────────────────────────────────
+# Generic edit/draw payload generation is common CAD behavior. Pipe adds
+# domain-specific patterns in PipeDrawCommandParser before falling back here.
+from backend.services.agents.common.draw_command import (
     DrawCommandParser,
     _DRAW_KEYWORDS,
     _MODIFY_KEYWORDS,
@@ -65,6 +65,281 @@ _PIPE_PATTERN_LAYER = "AI_PIPE_PATTERN"
 _PIPE_PROPOSAL_LAYER = "AI_PROPOSAL"
 _PIPE_NUMBER_RE = re.compile(r"(\d+(?:\.\d+)?)")
 _PIPE_SIZE_RE = re.compile(r"(?:DN\s*(\d{1,3})|(\d{1,3})\s*A)", re.IGNORECASE)
+_PIPE_LAYER_RE = re.compile(
+    r"GAS|PIPE|PIPING|SPRINK|CWS|HWS|FIRE|^P[-_]|^M[-_]|배관|급수|급탕|배수|위생|소화",
+    re.IGNORECASE,
+)
+_GENERIC_LAYER_RE = re.compile(r"^(?:0|L\d+|LAYER\d*|\d+)$", re.IGNORECASE)
+_PIPE_NOTE_RE = re.compile(
+    r"^(?:G|GAS|LPG|LNG|DN\s*\d+(?:\.\d+)?|\d{1,4}(?:\.\d+)?\s*A|\d{2,4}(?:\.\d+)?)$",
+    re.IGNORECASE,
+)
+_DELETE_REQUEST_RE = re.compile(r"삭제|지워|제거|delete|remove|erase", re.IGNORECASE)
+_WHOLE_SYMBOL_RE = re.compile(r"전체|심볼|기호|밸브|valve|symbol", re.IGNORECASE)
+_DIRECT_MODIFY_RE = re.compile(
+    r"레이어|layer|색상|색깔|컬러|color|굵기|두께|선굵기|lineweight|"
+    r"선종류|선 종류|linetype|삭제|지워|제거|delete|remove|erase|"
+    r"이동|옮겨|옮기|move|회전|돌려|rotate|스케일|scale|확대|축소|"
+    r"텍스트|글자|내용|attribute|속성|바꿔|바꾸|변경|수정해|수정하|칠해|칠하",
+    re.IGNORECASE,
+)
+
+_SYMBOL_CLUSTER_PAD = 45.0
+_SYMBOL_MEMBER_MAX = 1200.0
+_SYMBOL_CLUSTER_MAX = 1600.0
+
+
+def _parse_command_llm_response(response) -> dict:
+    if isinstance(response, dict):
+        return response
+    if not isinstance(response, str):
+        return {}
+
+    text = response.strip()
+    if not text:
+        return {}
+
+    candidates = [text]
+    if text.startswith("```"):
+        unfenced = "\n".join(
+            line for line in text.splitlines() if not line.strip().startswith("```")
+        ).strip()
+        if unfenced:
+            candidates.append(unfenced)
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidates.append(text[start : end + 1])
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = candidate.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        try:
+            return json.loads(normalized)
+        except json.JSONDecodeError:
+            continue
+
+    logging.debug("[PipeActionAgent] command parser JSON parse failed: %s", text[:500])
+    return {}
+
+
+def _selection_base_point(elements: list[dict], handles: list[str]) -> tuple[float, float] | None:
+    handle_set = {str(h) for h in handles if h}
+    if not handle_set:
+        return None
+
+    xs: list[float] = []
+    ys: list[float] = []
+    for entity in elements or []:
+        if not isinstance(entity, dict):
+            continue
+        if str(entity.get("handle") or entity.get("id") or "") not in handle_set:
+            continue
+
+        bbox = _entity_bbox(entity)
+        if bbox:
+            x1, y1, x2, y2 = bbox
+            xs.extend([x1, x2])
+            ys.extend([y1, y2])
+            continue
+
+        cx, cy = _entity_center(entity)
+        xs.append(cx)
+        ys.append(cy)
+
+    if not xs or not ys:
+        return None
+    return (min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0
+
+
+async def _llm_modify_cad_cmd(
+    user_request: str,
+    handles: list[str],
+    elements: list[dict],
+) -> dict | list[dict] | None:
+    try:
+        parsed = await generate_answer(
+            messages=[
+                {"role": "system", "content": _COMMAND_PARSE_SYSTEM},
+                {"role": "user", "content": user_request},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+        )
+    except Exception as exc:
+        logging.debug("[PipeActionAgent] small command parser LLM failed: %s", exc)
+        return None
+
+    parsed = _parse_command_llm_response(parsed)
+    if not isinstance(parsed, dict):
+        return None
+    if str(parsed.get("command_type") or "none").lower() != "modify":
+        return None
+
+    auto_fix = _build_modify_auto_fix(parsed)
+    if auto_fix is None:
+        logging.debug("[PipeActionAgent] command parser produced unsupported modify payload: %s", parsed)
+        return None
+
+    if not handles:
+        return {
+            "no_selection": True,
+            "message": (
+                "수정할 객체를 AutoCAD에서 먼저 선택하세요. "
+                f"(요청: {parsed.get('action_type', '?')} 변경)"
+            ),
+        }
+
+    fix_type = str(auto_fix.get("type") or "").upper()
+    if fix_type in {"ROTATE", "SCALE"}:
+        base = _selection_base_point(elements, handles)
+        if base is None:
+            logging.debug("[PipeActionAgent] %s command skipped: no selection base point", fix_type)
+            return None
+        auto_fix["base_x"], auto_fix["base_y"] = base
+
+    return [{**auto_fix, "_handle": str(handle)} for handle in handles]
+
+
+def _command_result_from_cad_cmd(cad_cmd: dict | list, user_request: str) -> dict | None:
+    if isinstance(cad_cmd, dict) and cad_cmd.get("no_selection"):
+        return {
+            "analysis": "No selected objects",
+            "fixes": [],
+            "message": cad_cmd.get(
+                "message",
+                "선택된 객체가 없습니다. AutoCAD에서 객체를 선택한 뒤 다시 요청해 주세요.",
+            ),
+        }
+
+    if isinstance(cad_cmd, dict):
+        auto_fix = _normalize_auto_fix(cad_cmd)
+        if not isinstance(auto_fix, dict):
+            return None
+        fix_type = str(auto_fix.get("type") or "ACTION").upper()
+        handles = [str(h) for h in (auto_fix.get("target_handles") or []) if h]
+        return {
+            "analysis": f"LLM 명령 파서가 {fix_type} 명령을 생성했습니다.",
+            "fixes": [{
+                "handle": handles[0] if handles else "",
+                "type": f"MULTI_{fix_type}" if handles else fix_type,
+                "reason": f"사용자 직접 수정 요청: {user_request}",
+                "action": fix_type,
+                "auto_fix": auto_fix,
+            }],
+            "message": f"요청을 {fix_type} 명령으로 해석했습니다.",
+        }
+
+    if not isinstance(cad_cmd, list):
+        return None
+
+    target_handles: list[str] = []
+    base_fix: dict | None = None
+    per_handle_fixes: list[dict] = []
+    can_bulk = True
+    for item in cad_cmd:
+        if not isinstance(item, dict):
+            can_bulk = False
+            continue
+        fix_item = dict(item)
+        handle = str(fix_item.pop("_handle", "") or "")
+        auto_fix = _normalize_auto_fix(fix_item)
+        if not isinstance(auto_fix, dict):
+            can_bulk = False
+            continue
+        fix_type = str(auto_fix.get("type") or "ACTION").upper()
+        auto_fix["type"] = fix_type
+        per_handle_fixes.append({
+            "handle": handle,
+            "type": "SELECTED_OBJECT",
+            "reason": f"사용자 직접 수정 요청: {user_request}",
+            "action": fix_type,
+            "auto_fix": auto_fix,
+        })
+        if not handle:
+            can_bulk = False
+        elif base_fix is None:
+            base_fix = dict(auto_fix)
+            target_handles.append(handle)
+        elif auto_fix == base_fix:
+            target_handles.append(handle)
+        else:
+            can_bulk = False
+
+    if can_bulk and base_fix and target_handles:
+        fix_type = str(base_fix.get("type") or "ACTION").upper()
+        base_fix["target_handles"] = target_handles
+        return {
+            "analysis": f"LLM 명령 파서가 선택 객체 {len(target_handles)}개에 {fix_type} 명령을 생성했습니다.",
+            "fixes": [{
+                "handle": target_handles[0],
+                "type": f"MULTI_{fix_type}",
+                "reason": f"사용자 직접 수정 요청: {user_request}",
+                "action": fix_type,
+                "auto_fix": base_fix,
+            }],
+            "message": f"선택하신 {len(target_handles)}개 객체에 요청하신 수정 내용을 적용할 준비를 마쳤습니다.",
+        }
+
+    if per_handle_fixes:
+        return {
+            "analysis": f"LLM 명령 파서가 선택 객체 {len(per_handle_fixes)}개에 수정 명령을 생성했습니다.",
+            "fixes": per_handle_fixes,
+            "message": f"선택하신 {len(per_handle_fixes)}개 객체에 각각 필요한 수정 내용을 준비했습니다.",
+        }
+
+    return None
+
+
+async def _selected_command_fix_for_pipe(
+    context: dict,
+    active_ids: set[str],
+    elements: list[dict],
+) -> dict | None:
+    user_request = (context.get("user_request") or "").strip()
+    if not user_request:
+        return None
+
+    active_ids_str = {str(x) for x in active_ids if x}
+    active_ids_ordered = [str(x) for x in (context.get("active_object_ids_ordered") or []) if x]
+    handles: list[str] = []
+    for handle in active_ids_ordered:
+        if handle in active_ids_str and handle not in handles:
+            handles.append(handle)
+    if not handles:
+        handles = sorted(active_ids_str)
+
+    entity_by_handle = {
+        str(e.get("handle") or e.get("id")): e
+        for e in elements or []
+        if isinstance(e, dict) and (e.get("handle") or e.get("id"))
+    }
+    parser_cmd = await PipeDrawCommandParser().parse(user_request, handles, entity_by_handle)
+    result = _command_result_from_cad_cmd(parser_cmd, user_request) if parser_cmd is not None else None
+    if result is not None:
+        logging.info(
+            "[PipeActionAgent] pipe draw command parser handled request handles=%d fixes=%d",
+            len(handles),
+            len(result.get("fixes") or []),
+        )
+        return result
+
+    if not _DIRECT_MODIFY_RE.search(user_request):
+        return None
+
+    cad_cmd = await _llm_modify_cad_cmd(user_request, handles, elements)
+    result = _command_result_from_cad_cmd(cad_cmd, user_request) if cad_cmd is not None else None
+    if result is not None:
+        logging.info(
+            "[PipeActionAgent] small command parser handled request handles=%d fixes=%d",
+            len(handles),
+            len(result.get("fixes") or []),
+        )
+    return result
 
 
 def _num_from_text(text: str, default: float) -> float:
@@ -110,6 +385,292 @@ def _entity_center(entity: dict) -> tuple[float, float]:
             (float(start.get("y", 0)) + float(end.get("y", 0))) / 2.0,
         )
     return 0.0, 0.0
+
+
+def _raw_entity_type(entity: dict) -> str:
+    return str(entity.get("raw_type") or entity.get("type") or "").upper()
+
+
+def _entity_handle(entity: dict) -> str:
+    return str(entity.get("handle") or entity.get("id") or "")
+
+
+def _xy(point: dict | None) -> tuple[float, float] | None:
+    if not isinstance(point, dict) or "x" not in point or "y" not in point:
+        return None
+    try:
+        return float(point["x"]), float(point["y"])
+    except (TypeError, ValueError):
+        return None
+
+
+def _entity_bbox(entity: dict) -> tuple[float, float, float, float] | None:
+    bbox = entity.get("bbox")
+    if isinstance(bbox, dict):
+        try:
+            if {"x1", "y1", "x2", "y2"}.issubset(bbox):
+                return float(bbox["x1"]), float(bbox["y1"]), float(bbox["x2"]), float(bbox["y2"])
+            if {"min_x", "min_y", "max_x", "max_y"}.issubset(bbox):
+                return (
+                    float(bbox["min_x"]),
+                    float(bbox["min_y"]),
+                    float(bbox["max_x"]),
+                    float(bbox["max_y"]),
+                )
+        except (TypeError, ValueError, KeyError):
+            return None
+
+    pts = [p for p in (_xy(entity.get("start")), _xy(entity.get("end")), _xy(entity.get("center"))) if p]
+    if pts:
+        return min(p[0] for p in pts), min(p[1] for p in pts), max(p[0] for p in pts), max(p[1] for p in pts)
+    return None
+
+
+def _bbox_near(
+    a: tuple[float, float, float, float] | None,
+    b: tuple[float, float, float, float] | None,
+    pad: float,
+) -> bool:
+    if not a or not b:
+        return False
+    ax1, ay1, ax2, ay2 = min(a[0], a[2]), min(a[1], a[3]), max(a[0], a[2]), max(a[1], a[3])
+    bx1, by1, bx2, by2 = min(b[0], b[2]), min(b[1], b[3]), max(b[0], b[2]), max(b[1], b[3])
+    return not (
+        ax2 + pad < bx1
+        or bx2 + pad < ax1
+        or ay2 + pad < by1
+        or by2 + pad < ay1
+    )
+
+
+def _bbox_merge(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    return min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])
+
+
+def _bbox_max_dim(bbox: tuple[float, float, float, float] | None) -> float:
+    if not bbox:
+        return 0.0
+    return max(abs(bbox[2] - bbox[0]), abs(bbox[3] - bbox[1]))
+
+
+def _entity_length(entity: dict) -> float:
+    try:
+        if entity.get("length") is not None:
+            return float(entity.get("length") or 0)
+    except (TypeError, ValueError):
+        pass
+    s = _xy(entity.get("start"))
+    e = _xy(entity.get("end"))
+    if not s or not e:
+        return 0.0
+    return math.hypot(e[0] - s[0], e[1] - s[1])
+
+
+def _has_pipe_evidence(entity: dict) -> bool:
+    attrs = entity.get("attributes") or {}
+    layer = str(entity.get("layer") or "")
+    material = str(entity.get("material") or attrs.get("MATERIAL") or "").upper()
+    role = str(entity.get("layer_role") or "").lower()
+    return bool(
+        role == "mep"
+        or entity.get("flag_for_piping_agent")
+        or _PIPE_LAYER_RE.search(layer)
+        or material not in {"", "UNKNOWN", "NONE"}
+        or entity.get("diameter_mm")
+        or attrs.get("SIZE")
+        or attrs.get("DIAMETER")
+        or attrs.get("TAG_NAME")
+    )
+
+
+def _is_pipe_note(entity: dict) -> bool:
+    if _raw_entity_type(entity) not in {"TEXT", "MTEXT", "MLEADER", "LEADER"}:
+        return False
+    text = str(entity.get("text") or entity.get("content") or "").strip()
+    return bool(text and _PIPE_NOTE_RE.match(text.replace(" ", "")))
+
+
+def _is_symbol_candidate(entity: dict) -> bool:
+    raw = _raw_entity_type(entity)
+    if raw not in {"LINE", "ARC", "POLYLINE", "LWPOLYLINE", "SPLINE", "CIRCLE", "ELLIPSE"}:
+        return False
+    if _has_pipe_evidence(entity) and _entity_length(entity) >= _SYMBOL_MEMBER_MAX:
+        return False
+    bbox = _entity_bbox(entity)
+    if not bbox or _bbox_max_dim(bbox) > _SYMBOL_MEMBER_MAX:
+        return False
+    layer = str(entity.get("layer") or "").strip()
+    if _GENERIC_LAYER_RE.match(layer):
+        return True
+    if raw in {"CIRCLE", "ELLIPSE"}:
+        return True
+    return _entity_length(entity) <= _SYMBOL_MEMBER_MAX
+
+
+def _classify_pipe_entity(entity: dict, cluster_size: int = 1) -> str:
+    raw = _raw_entity_type(entity)
+    if _is_pipe_note(entity):
+        return "pipe_annotation"
+    if raw in {"TEXT", "MTEXT", "MLEADER", "LEADER"}:
+        return "annotation"
+    if raw in {"INSERT", "BLOCK"}:
+        return "equipment_or_block"
+    if raw in {"LINE", "ARC", "POLYLINE", "LWPOLYLINE", "SPLINE"}:
+        if _has_pipe_evidence(entity) and not (_GENERIC_LAYER_RE.match(str(entity.get("layer") or "")) and _entity_length(entity) < 1500):
+            return "pipe_centerline"
+        if cluster_size > 1 or _is_symbol_candidate(entity):
+            return "symbol_fragment"
+        return "line_geometry"
+    if raw in {"CIRCLE", "ELLIPSE"}:
+        return "symbol_fragment"
+    return "other"
+
+
+def _symbol_cluster_for_selection(selected: list[dict], surrounding: list[dict]) -> list[dict]:
+    seeds = [e for e in selected if _is_symbol_candidate(e)]
+    if not seeds:
+        return []
+    candidates = [
+        e for e in [*selected, *surrounding]
+        if _entity_handle(e) and _is_symbol_candidate(e)
+    ]
+    if not candidates:
+        return []
+
+    selected_handles = {_entity_handle(e) for e in seeds}
+    seen = {
+        idx for idx, e in enumerate(candidates)
+        if _entity_handle(e) in selected_handles
+    }
+    stack = list(seen)
+    cluster_bbox: tuple[float, float, float, float] | None = None
+    while stack:
+        idx = stack.pop()
+        bbox = _entity_bbox(candidates[idx])
+        if not bbox:
+            continue
+        cluster_bbox = bbox if cluster_bbox is None else _bbox_merge(cluster_bbox, bbox)
+        for j, other in enumerate(candidates):
+            if j in seen:
+                continue
+            if _bbox_near(bbox, _entity_bbox(other), _SYMBOL_CLUSTER_PAD):
+                merged = _bbox_merge(cluster_bbox, _entity_bbox(other) or bbox)
+                if _bbox_max_dim(merged) <= _SYMBOL_CLUSTER_MAX:
+                    seen.add(j)
+                    stack.append(j)
+
+    cluster = [candidates[idx] for idx in sorted(seen)]
+    if len(cluster) <= 1:
+        return []
+    return cluster
+
+
+def _selection_context(selected: list[dict], surrounding: list[dict]) -> dict:
+    cluster = _symbol_cluster_for_selection(selected, surrounding)
+    cluster_handles = [_entity_handle(e) for e in cluster if _entity_handle(e)]
+    selected_roles = []
+    role_counts: dict[str, int] = {}
+    for entity in selected:
+        role = _classify_pipe_entity(entity, len(cluster) if _entity_handle(entity) in cluster_handles else 1)
+        selected_roles.append(
+            {
+                "handle": _entity_handle(entity),
+                "role": role,
+                "type": _raw_entity_type(entity),
+                "layer": entity.get("layer"),
+            }
+        )
+        role_counts[role] = role_counts.get(role, 0) + 1
+    dominant_role = max(role_counts, key=role_counts.get) if role_counts else "unknown"
+    return {
+        "selected_count": len(selected),
+        "roles": selected_roles,
+        "role_counts": role_counts,
+        "dominant_role": dominant_role,
+        "symbol_cluster_handles": cluster_handles,
+        "symbol_cluster_count": len(cluster_handles),
+    }
+
+
+def _plan_summary_from_fixes(fixes: list[dict]) -> dict:
+    counts: dict[str, int] = {}
+    target_handles: list[str] = []
+    for fix in fixes or []:
+        action = str(fix.get("action") or (fix.get("auto_fix") or {}).get("type") or "UNKNOWN").upper()
+        counts[action] = counts.get(action, 0) + 1
+        handle = str(fix.get("handle") or "")
+        if handle and handle not in target_handles:
+            target_handles.append(handle)
+    parts = [f"{count}개 {action}" for action, count in sorted(counts.items())]
+    summary = ", ".join(parts) if parts else "수정 없음"
+    return {
+        "summary": summary,
+        "operation_counts": counts,
+        "target_handles": target_handles,
+        "target_count": len(target_handles),
+        "requires_confirmation": bool(fixes),
+    }
+
+
+def _symbol_delete_preflight(
+    user_request: str,
+    selected: list[dict],
+    surrounding: list[dict],
+) -> dict | None:
+    if not _DELETE_REQUEST_RE.search(user_request or ""):
+        return None
+    context = _selection_context(selected, surrounding)
+    cluster_handles = context.get("symbol_cluster_handles") or []
+    if context.get("dominant_role") != "symbol_fragment" or len(cluster_handles) <= 1:
+        return None
+
+    fixes = [
+        {
+            "handle": handle,
+            "type": "SYMBOL_FRAGMENT",
+            "reason": "선택 객체가 사용자 작성 배관 심볼의 일부로 보여 심볼 단위 삭제 후보에 포함했습니다.",
+            "action": "DELETE",
+            "auto_fix": {
+                "type": "DELETE",
+                "requires_confirmation": True,
+                "selection_role": "symbol_fragment",
+                "symbol_cluster_handles": cluster_handles,
+            },
+        }
+        for handle in cluster_handles
+    ]
+    plan = _plan_summary_from_fixes(fixes)
+    explicit_whole = bool(_WHOLE_SYMBOL_RE.search(user_request or ""))
+    message = (
+        f"선택한 객체는 배관 심볼 조각으로 보입니다. 관련 조각 {len(cluster_handles)}개를 하나의 심볼로 보고 "
+        f"삭제 계획을 만들었습니다. 적용할까요?"
+        if explicit_whole
+        else f"이 객체는 배관 심볼 일부로 보여 단독 삭제하면 기호가 깨질 수 있습니다. "
+             f"관련 조각 {len(cluster_handles)}개 전체를 삭제하는 계획으로 진행할까요?"
+    )
+    return {
+        "analysis": "선택 객체를 배관 심볼 조각으로 분류하고, 주변의 작은 도형을 같은 심볼 클러스터로 묶었습니다.",
+        "selection_context": context,
+        "action_plan": plan,
+        "fixes": fixes,
+        "message": message,
+    }
+
+
+def _attach_action_plan(result: dict, selected: list[dict], surrounding: list[dict]) -> dict:
+    fixes = result.get("fixes") or []
+    result.setdefault("selection_context", _selection_context(selected, surrounding))
+    result.setdefault("action_plan", _plan_summary_from_fixes(fixes))
+    if fixes and "적용" not in str(result.get("message") or ""):
+        plan = result["action_plan"]
+        result["message"] = (
+            f"{result.get('message') or '수정 계획을 만들었습니다'} "
+            f"계획: {plan.get('summary')}. 적용할까요?"
+        )
+    return result
 
 
 def _rect_vertices(cx: float, cy: float, width: float, height: float) -> list[dict]:
@@ -318,6 +879,9 @@ class PipeDrawCommandParser(DrawCommandParser):
         offset = _length_from_text(text, 500.0)
         cx = base_x + (offset if selected else 0.0)
         cy = base_y
+
+        if wants_recommendation and not selected and not has_draw:
+            return None
 
         if wants_recommendation:
             return self._proposal_note(base_x, base_y, text, selected)
@@ -542,6 +1106,18 @@ class ActionAgent:
             selected_keys = {e.get("handle") for e in selected} | {e.get("id") for e in selected}
             surrounding = [e for e in all_elements
                            if e.get("handle") not in selected_keys and e.get("id") not in selected_keys]
+            if not selected and drawing_data:
+                fallback_parsed = self.parser.parse(drawing_data, mapping_table={})
+                fallback_elements = fallback_parsed.get("elements") or []
+                selected = [
+                    e for e in fallback_elements
+                    if e.get("handle") in active_ids or e.get("id") in active_ids
+                ]
+                selected_keys = {e.get("handle") for e in selected} | {e.get("id") for e in selected}
+                surrounding = [
+                    e for e in fallback_elements
+                    if e.get("handle") not in selected_keys and e.get("id") not in selected_keys
+                ]
         elif is_focus_mode:
             # 포커스 영역 전체 대상
             selected    = all_elements
@@ -551,6 +1127,11 @@ class ActionAgent:
             selected    = all_elements
             surrounding = []
 
+        command_elements = all_elements or [*selected, *surrounding]
+        command_parser_result = await _selected_command_fix_for_pipe(context, active_ids, command_elements)
+        if command_parser_result is not None:
+            return command_parser_result
+
         if not selected:
             logging.info("[ActionAgent] 분석 대상 없음 (active_ids=%s, count=%d)", active_ids, len(all_elements))
             return {
@@ -558,6 +1139,11 @@ class ActionAgent:
                 "fixes": [],
                 "message": "수정할 객체를 AutoCAD에서 선택하거나 범위에 포함시킨 후 다시 시도하세요."
             }
+
+        user_instr = (context.get("user_request") or "").strip()
+        delete_preflight = _symbol_delete_preflight(user_instr, selected, surrounding)
+        if delete_preflight is not None:
+            return delete_preflight
 
         retrieved_laws = context.get("retrieved_laws") or []
         law_text = "\n".join(
@@ -694,8 +1280,11 @@ class ActionAgent:
 
             result["fixes"] = clean_fixes
             result.setdefault("analysis", "분석 완료")
-            result.setdefault("message", f"선택 객체 {len(selected)}개 분석 완료. {len(result['fixes'])}개 수정 필요.")
-            return result
+            result.setdefault(
+                "message",
+                f"선택하신 {len(selected)}개 객체를 살펴봤고, 그중 {len(result['fixes'])}개 수정 항목을 찾았습니다.",
+            )
+            return _attach_action_plan(result, selected, surrounding)
         except Exception as e:
             logging.error("[ActionAgent] LLM 분석 실패: %s", e)
             return {

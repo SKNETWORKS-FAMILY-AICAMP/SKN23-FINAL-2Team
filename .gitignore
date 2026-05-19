@@ -26,7 +26,7 @@ dist-ssr
 *.venv
 *venv
 *venv*
-
+.env.ec2
 .env
 scripts/tunnel.env
 skn23-2team-key.pem
@@ -63,6 +63,7 @@ __pycache__/
 # --- C# / .NET ---
 obj/
 bin/
+.dotnet_home/
 *.dll
 *.pdb
 *.exe
@@ -94,7 +95,6 @@ mlruns/
 # --- AI Tools ---
 .forge-log
 .claude/
-.gemini/
 CLAUDE.md
 GEMINI.md
 gemini.md
@@ -124,7 +124,6 @@ catboost_info/
 # --- Vite 자동 생성 캐시 ---
 frontend/.vite/
 
-
 # --- kjw ---
 file_scale.py
 *.bak*
@@ -133,20 +132,11 @@ file_scale.py
 debug_*.json
 generate_test_elec_dxf.py
 
+# Plugin build artifacts
+build_output/
 
-finetune/*
-data/*
-/docs/분류기/*
-scripts/*
-temp_dxf/*
-*.yml
-*.env
-backend/tests/*
-backend/sql/*
-docs/데이터전처리.html
-.gemini/settings.json
-frontend/src/components/setting/ApiKeyManagerModal.tsx
-output_json/*
-docs/database/*
-mcp_server/
+.env*
+.pem*
+.venv*
 
+# CadSllmAgent

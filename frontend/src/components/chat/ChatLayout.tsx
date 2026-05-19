@@ -10,6 +10,7 @@ export function Header({
   onShowList,
   onNewChat,
   isConnected,
+  connectionStatus,
 }: any) {
   const domainMap: Record<string, { label: string }> = {
     전기: { label: "전기" },
@@ -18,10 +19,15 @@ export function Header({
     소방: { label: "소방" },
   };
   const domain = typeof agent === "string" ? domainMap[agent] : undefined;
-  const statusClassName = isConnected
+  const effectiveConnectionStatus =
+    connectionStatus ?? (typeof isConnected === "boolean" ? (isConnected ? "connected" : "connecting") : undefined);
+  const isBackendConnected = effectiveConnectionStatus === "connected";
+  const showConnectionStatus = typeof effectiveConnectionStatus === "string";
+  const connectionLabel = isBackendConnected ? "연결됨" : "연결 실패";
+  const statusClassName = isBackendConnected
     ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-300"
     : "border-red-500/25 bg-red-500/10 text-red-300";
-  const statusDotClassName = isConnected ? "bg-emerald-300 animate-pulse" : "bg-red-500";
+  const statusDotClassName = isBackendConnected ? "bg-emerald-300 animate-pulse" : "bg-red-500";
 
   return (
     <header className="relative z-50 flex h-14 items-center justify-between border-b border-slate-800 bg-[#07111f] px-2 backdrop-blur-md">
@@ -45,7 +51,11 @@ export function Header({
         {domain && (
           <span
             className={`flex shrink-0 items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-semibold leading-none ${statusClassName}`}
-            title={`현재 도메인: ${domain.label} · ${isConnected ? "연결됨" : "연결 끊김"}`}
+            title={
+              showConnectionStatus
+                ? `현재 도메인: ${domain.label} · ${connectionLabel}`
+                : `현재 도메인: ${domain.label}`
+            }
           >
             <span className={`h-1.5 w-1.5 rounded-full ${statusDotClassName}`} />
             {domain.label}

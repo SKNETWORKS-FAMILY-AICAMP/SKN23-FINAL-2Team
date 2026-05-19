@@ -10,17 +10,35 @@ class ReportAgent:
     def generate(self, violations: list, drawing_id: str = "") -> dict:
         items = []
         for v in violations:
+            equipment_id = v.get("equipment_id") or v.get("object_id") or v.get("handle") or "UNKNOWN"
             item = {
-                "equipment_id": v.get("equipment_id", "UNKNOWN"),
+                "equipment_id": equipment_id,
+                "object_id": v.get("object_id") or equipment_id,
                 "violation_type": v.get("violation_type", "general_error"),
-                "severity": "High",
+                "severity": v.get("severity", "High"),
                 "description": v.get("reason", ""),
                 "required_value": v.get("required_value", ""),
                 "current_value": v.get("current_value", ""),
-                "reference": v.get("reference_rule", ""),
-                "reference_rule": v.get("reference_rule", ""),
+                "reference": v.get("reference_rule") or v.get("legal_reference", ""),
+                "reference_rule": v.get("reference_rule") or v.get("legal_reference", ""),
+                "legal_reference": v.get("legal_reference", ""),
                 "reason": v.get("reason", ""),
+                "suggestion": v.get("suggestion") or v.get("reason", ""),
             }
+            for key in (
+                "category",
+                "bbox",
+                "target_bbox",
+                "ref_bbox",
+                "midpoint",
+                "affected_handles",
+                "terminal_candidate_id",
+                "confidence_score",
+                "confidence_reason",
+                "modification_tier",
+            ):
+                if key in v:
+                    item[key] = v[key]
             pa = v.get("proposed_action")
             if isinstance(pa, dict) and pa:
                 item["proposed_action"] = pa

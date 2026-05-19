@@ -76,30 +76,42 @@ class RevisionAgent:
             if pos and not current:
                 current = pos
 
+            def _fix_row(proposed_fix: dict) -> dict:
+                row = {
+                    "equipment_id":   target_id,
+                    "violation_type": v_type,
+                    "_source":        violation.get("_source", "llm"),
+                    "position":       pos,
+                    "proposed_fix":   proposed_fix,
+                }
+                for extra_key in ("related_handles", "group_id", "display_object_id"):
+                    if violation.get(extra_key):
+                        row[extra_key] = violation.get(extra_key)
+                return row
+
             # ── Phase 6: 낮은 신뢰도 위반 수동 검토 강제 ───────────────────
             confidence = violation.get("confidence_score", 1.0)
             if isinstance(confidence, (int, float)) and confidence < _MIN_CONFIDENCE_FOR_AUTO_FIX:
-                fixes.append({
-                    "equipment_id": target_id,
-                    "_source":       violation.get("_source", "llm"),
-                    "position":      pos,
-                    "proposed_fix": {
+                fixes.append(
+                    _fix_row({
                         "action": RevisionAction.MANUAL_REVIEW,
                         "reason": (
                             f"신뢰도 낮음 (confidence={confidence:.2f} < {_MIN_CONFIDENCE_FOR_AUTO_FIX}) "
                             f"— 자동 수정 보류. 원인: {violation.get('confidence_reason', '-')}"
                         ),
-                    },
-                })
+                    })
+                )
                 continue
 
+            proposed_action = violation.get("proposed_action")
+            if isinstance(proposed_action, dict):
+                ptype = str(proposed_action.get("type") or proposed_action.get("action") or "").upper()
+                if ptype and ptype != "MANUAL_REVIEW":
+                    fixes.append(_fix_row(proposed_action))
+                    continue
+
             fix_action = self._dispatch(v_type, violation, current)
-            fixes.append({
-                "equipment_id": target_id,
-                "_source":       violation.get("_source", "llm"),
-                "position":      pos,
-                "proposed_fix":  fix_action,
-            })
+            fixes.append(_fix_row(fix_action))
         return fixes
 
     def _dispatch(self, v_type: str, violation: dict, current: dict) -> dict:
@@ -207,7 +219,7 @@ class RevisionAgent:
         recommended_dn: float | None = None
 
         # 유량 파싱: "1.5m³/h" or "Q=1.5m³/h"
-        q_m = re.search(r"([\\d.]+)\s*m³/h", reason)
+        q_m = re.search(r"([\d.]+)\s*m³/h", reason)
         # 한계 유속 파싱: "한계 3.0m/s"
         v_m = re.search(r"한계\s*([\d.]+)\s*m/s", reason)
         if q_m and v_m:

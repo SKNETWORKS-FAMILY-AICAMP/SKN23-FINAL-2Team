@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Windows;
 using Microsoft.Web.WebView2.Wpf;
 using Microsoft.Web.WebView2.Core;
+using CadSllmAgent.Services;
 
 namespace CadSllmAgent.UI
 {
@@ -80,8 +81,17 @@ namespace CadSllmAgent.UI
                         using var doc = JsonDocument.Parse(message);
                         if (!doc.RootElement.TryGetProperty("action", out var actionEl)) return;
                         var action = actionEl.GetString();
-                        if (action == "TEMP_SPEC_SELECTION" && doc.RootElement.TryGetProperty("payload", out var payload))
+                        if (action == "SPEC_MODAL_READY")
+                            PostTempSpecLinkFromDiskToModal();
+                        else if (action == "TEMP_SPEC_SELECTION" && doc.RootElement.TryGetProperty("payload", out var payload))
+                        {
                             AgentPalette.HandleTempSpecSelectionPayload(payload);
+                        }
+                        else if (action == "TEMP_SPEC_LINK_CLEAR_CURRENT")
+                        {
+                            AgentPalette.HandleTempSpecLinkClearCurrent();
+                            _webView.CoreWebView2.PostWebMessageAsString("{\"action\":\"TEMP_SPEC_LINK_CLEARED\"}");
+                        }
                         else if (action == "CLOSE_MODAL")
                             this.Close();
                     }
@@ -97,6 +107,37 @@ namespace CadSllmAgent.UI
                     System.Windows.MessageBoxButton.OK,
                     System.Windows.MessageBoxImage.Error
                 );
+            }
+        }
+
+        private void PostTempSpecLinkFromDiskToModal()
+        {
+            try
+            {
+                var dwgDir = TempSpecLinkService.GetActiveDwgDirectory();
+                if (string.IsNullOrWhiteSpace(dwgDir))
+                {
+                    _webView.CoreWebView2.PostWebMessageAsString("{\"action\":\"TEMP_SPEC_LINK_CLEARED\"}");
+                    return;
+                }
+                var json = TempSpecLinkService.ReadLinkJson(dwgDir);
+                if (string.IsNullOrWhiteSpace(json))
+                {
+                    _webView.CoreWebView2.PostWebMessageAsString("{\"action\":\"TEMP_SPEC_LINK_CLEARED\"}");
+                    return;
+                }
+                var trimmed = json.Trim();
+                if (!trimmed.StartsWith("{"))
+                {
+                    _webView.CoreWebView2.PostWebMessageAsString("{\"action\":\"TEMP_SPEC_LINK_CLEARED\"}");
+                    return;
+                }
+                _webView.CoreWebView2.PostWebMessageAsString(
+                    "{\"action\":\"TEMP_SPEC_LINK_LOADED\",\"payload\":" + trimmed + "}");
+            }
+            catch
+            {
+                // Sidecar sync is best-effort; the backend remains the source of truth.
             }
         }
     }

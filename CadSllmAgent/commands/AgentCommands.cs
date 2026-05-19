@@ -11,9 +11,11 @@
  * - 2026-04-15 (김지우) : AI 수정 테스트용 커맨드(TEST_AI_FIX) 및 참조(using) 추가
  */
 using System;
-using System.Diagnostics;
+using System.IO;
+using System.Text;
 using Autodesk.AutoCAD.Runtime;
 using Autodesk.AutoCAD.ApplicationServices;
+using CadSllmAgent.Extraction;
 using CadSllmAgent.UI;
 using CadSllmAgent.Services;
 
@@ -30,6 +32,43 @@ namespace CadSllmAgent.commands
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
     public class AgentCommands
     {
+        private static string ExportCadJson(bool selectedOnly)
+        {
+            var doc = AcApp.DocumentManager.MdiActiveDocument
+                ?? throw new InvalidOperationException("No active AutoCAD document.");
+
+            var data = selectedOnly
+                ? CadDataExtractor.ExtractSelected()
+                : CadDataExtractor.Extract(maxEntityCount: null);
+
+            if (data == null)
+                throw new InvalidOperationException("No selected entities were found. Select objects first or use CADJSONEXPORT.");
+
+            var exportDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "CadSllmAgent",
+                "exports");
+            Directory.CreateDirectory(exportDir);
+
+            var drawingName = Path.GetFileNameWithoutExtension(doc.Name);
+            if (string.IsNullOrWhiteSpace(drawingName))
+                drawingName = "drawing";
+
+            foreach (var ch in Path.GetInvalidFileNameChars())
+                drawingName = drawingName.Replace(ch, '_');
+
+            var scope = selectedOnly ? "selected" : "full";
+            var fileName = $"{drawingName}_{scope}_{DateTime.Now:yyyyMMdd_HHmmss}.json";
+            var path = Path.Combine(exportDir, fileName);
+
+            File.WriteAllText(
+                path,
+                CadDataExtractor.ToJson(data),
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+
+            return path;
+        }
+
         // ── 에이전트별 AutoCAD 커맨드 ────────────────────────────────
         // 커맨드 라인에서 직접 타이핑하거나, 상단 메뉴바 클릭 시 실행됨
 
@@ -52,40 +91,37 @@ namespace CadSllmAgent.commands
         [CommandMethod("AGENTTOGGLE")]
         public void ToggleAgent() => AgentPalette.Toggle();
 
-        /// <summary>
-        /// 디버그 로그 파일 경로 + 마지막 줄을 커맨드 창에 표시. 오류 조사용.
-        /// 파일: %LocalAppData%\CadSllmAgent\cad_agent_debug.log
-        /// </summary>
-        [CommandMethod("CADAGENTLOG")]
-        public void ShowDebugLog()
+        [CommandMethod("CADJSONEXPORT")]
+        public void ExportCurrentDrawingJson()
         {
             var ed = AcApp.DocumentManager.MdiActiveDocument?.Editor;
-            var path = CadDebugLog.GetLogFilePath();
-            CadDebugLog.Info("CADAGENTLOG 명령으로 로그 tail 표시");
-            ed?.WriteMessage($"\n[CAD-Agent] Debug log: {path}\n");
-            ed?.WriteMessage(CadDebugLog.ReadTail(35));
-        }
-
-        /// <summary>위 로그를 메모장으로 연다 (경로는 CADAGENTLOG와 동일).</summary>
-        [CommandMethod("CADAGENTLOGOPEN")]
-        public void OpenDebugLogInNotepad()
-        {
-            var path = CadDebugLog.GetLogFilePath();
-            CadDebugLog.Info("CADAGENTLOGOPEN — 메모장에서 로그 열기");
             try
             {
-                Process.Start(new ProcessStartInfo
-                {
-                    FileName = "notepad.exe",
-                    Arguments = path,
-                    UseShellExecute = true,
-                });
+                var path = ExportCadJson(selectedOnly: false);
+                CadDebugLog.Info($"CADJSONEXPORT saved: {path}");
+                ed?.WriteMessage($"\n[CAD-Agent] JSON export saved: {path}\n");
             }
             catch (System.Exception ex)
             {
-                CadDebugLog.Exception("CADAGENTLOGOPEN", ex);
-                AcApp.DocumentManager.MdiActiveDocument?.Editor?.WriteMessage(
-                    $"\n[CAD-Agent] 메모장 실행 실패: {ex.Message}\n수동으로 열기: {path}\n");
+                CadDebugLog.Exception("CADJSONEXPORT", ex);
+                ed?.WriteMessage($"\n[CAD-Agent] JSON export failed: {ex.Message}\n");
+            }
+        }
+
+        [CommandMethod("CADJSONEXPORTSEL")]
+        public void ExportSelectedDrawingJson()
+        {
+            var ed = AcApp.DocumentManager.MdiActiveDocument?.Editor;
+            try
+            {
+                var path = ExportCadJson(selectedOnly: true);
+                CadDebugLog.Info($"CADJSONEXPORTSEL saved: {path}");
+                ed?.WriteMessage($"\n[CAD-Agent] selected JSON export saved: {path}\n");
+            }
+            catch (System.Exception ex)
+            {
+                CadDebugLog.Exception("CADJSONEXPORTSEL", ex);
+                ed?.WriteMessage($"\n[CAD-Agent] selected JSON export failed: {ex.Message}\n");
             }
         }
 

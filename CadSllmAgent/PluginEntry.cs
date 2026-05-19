@@ -39,6 +39,8 @@ namespace CadSllmAgent
         public void Terminate()
         {
             AcApp.DocumentManager.DocumentActivated -= OnDocumentActivated;
+            DrawingRevisionTracker.UnhookDocumentEvents();
+            DrawingRevisionTracker.ResetForDocumentSwitch();
             SocketClient.StopAndDispose();
         }
 
@@ -49,15 +51,17 @@ namespace CadSllmAgent
                 // 1. 도면이 바뀌었으니 React의 위반사항 UI를 비워라!
                 AgentPalette.PostMessage("{\"action\":\"CLEAR_REVIEW_UI\"}");
                 AgentPalette.NotifyActiveDocumentChanged();
+                DrawingRevisionTracker.UnhookDocumentEvents();
+                DrawingRevisionTracker.ResetForDocumentSwitch();
 
                 // 2. 새 Document에 ImpliedSelectionChanged 재등록 (문서 전환 시 이벤트 복원)
                 //    기존 Document의 핸들러는 HookSelectionEvents 내부에서 자동 해제됨
                 // 이거 지우면 가만 안둠 !!!!!!!! (중요중요중요)
                 CadDataExtractor.HookSelectionEvents(forceRehook: true);
+                DrawingRevisionTracker.RefreshSnapshotBaselineForActiveDocument("document_activated");
 
                 var dir = TempSpecLinkService.GetActiveDwgDirectory();
-                if (!string.IsNullOrEmpty(dir))
-                    AgentPalette.SyncTempSpecLinkFromDisk(dir);
+                AgentPalette.SyncTempSpecLinkFromDisk(dir);
             }
             catch (System.Exception ex)
             {
@@ -84,13 +88,21 @@ namespace CadSllmAgent
             return $"{Environment.MachineName}-{Environment.UserName}".ToLowerInvariant();
         }
 
+        private int _menuRetryCount = 0;
+        private const int MAX_MENU_RETRIES = 10;
+        private System.Timers.Timer? _menuRetryTimer;
+
         private void Application_Idle(object? sender, EventArgs e)
         {
             try
             {
                 AcApp.Idle -= Application_Idle;
-                CreateTopMenuBar();
+
+                SafeTaskDispatcher.CaptureUiDispatcher();
                 CadDataExtractor.HookSelectionEvents();
+
+                // 플러그인 자동 업데이트 체크 (논블로킹 — 실패해도 플러그인 동작에 영향 없음)
+                _ = UpdateChecker.CheckAndPrepareAsync();
 
                 try
                 {
@@ -103,6 +115,9 @@ namespace CadSllmAgent
                 }
 
                 _ = SocketClient.ConnectAsync();
+
+                // 메뉴 생성: 타이머 기반 지연 재시도 (2초 간격)
+                TryCreateMenuWithDelay();
             }
             catch (System.Exception ex)
             {
@@ -111,7 +126,46 @@ namespace CadSllmAgent
             }
         }
 
-        private void CreateTopMenuBar()
+        private void TryCreateMenuWithDelay()
+        {
+            bool created = CreateTopMenuBar();
+            if (created)
+            {
+                CadDebugLog.Info("Agent 메뉴 생성 성공");
+                return;
+            }
+
+            if (_menuRetryCount >= MAX_MENU_RETRIES)
+            {
+                CadDebugLog.Info($"Agent 메뉴 생성 실패 ({MAX_MENU_RETRIES}회 시도). 명령창에서 직접 접근하세요.");
+                return;
+            }
+
+            _menuRetryCount++;
+            CadDebugLog.Info($"메뉴 생성 재시도 예약 ({_menuRetryCount}/{MAX_MENU_RETRIES}) - 2초 후");
+            _menuRetryTimer = new System.Timers.Timer(2000);
+            _menuRetryTimer.AutoReset = false;
+            _menuRetryTimer.Elapsed += (s, args) =>
+            {
+                SafeTaskDispatcher.EnqueueSafeTask(() =>
+                {
+                    try
+                    {
+                        AcApp.Idle += MenuRetry_Idle;
+                    }
+                    catch { }
+                });
+            };
+            _menuRetryTimer.Start();
+        }
+
+        private void MenuRetry_Idle(object? sender, EventArgs e)
+        {
+            AcApp.Idle -= MenuRetry_Idle;
+            TryCreateMenuWithDelay();
+        }
+
+        private bool CreateTopMenuBar()
         {
             try
             {
@@ -122,13 +176,13 @@ namespace CadSllmAgent
                 catch { }
 
                 var acadApp = AcApp.AcadApplication as Autodesk.AutoCAD.Interop.AcadApplication;
-                if (acadApp == null) return;
+                if (acadApp == null) return false;
 
                 var menuGroup = acadApp.MenuGroups.Item(0);
-                if (menuGroup == null) return;
+                if (menuGroup == null) return false;
 
                 var popMenus = menuGroup.Menus;
-                if (popMenus == null) return;
+                if (popMenus == null) return false;
 
                 try
                 {
@@ -147,13 +201,12 @@ namespace CadSllmAgent
                     agentMenu.AddSeparator(agentMenu.Count);
                     agentMenu.AddMenuItem(agentMenu.Count, "시방서 관리...", "AGENT_SPEC_MANAGE ");
                     agentMenu.AddMenuItem(agentMenu.Count, "API키 관리...", "AGENT_KEY_MANAGE ");
-                    agentMenu.AddMenuItem(agentMenu.Count, "디버그 로그 (명령창)…", "CADAGENTLOG ");
-                    agentMenu.AddMenuItem(agentMenu.Count, "디버그 로그 (메모장)", "CADAGENTLOGOPEN ");
                     agentMenu.InsertInMenuBar(acadApp.MenuBar.Count);
+                    return true;
                 }
-                catch { }
+                catch { return false; }
             }
-            catch { }
+            catch { return false; }
         }
 
         private static void Log(string msg) =>

@@ -18,10 +18,13 @@ import ChatStatusStrip from "./chat/ChatStatusStrip";
 import ChatMessageRow from "./chat/ChatMessageRow";
 import { Header, TabBar, InputBar } from "./chat/ChatLayout";
 import { ViolationPane } from "./cad/ViolationReview";
-import UnmappedLayersModal from "./cad/UnmappedLayersModal";
+import { getDocumentApiHeaders, isAgentApiRegistered } from "../utils/documentApiAuth";
+import DogLoadingGame from "./chat/loading/DogLoadingGame";
+import TetrisLoadingGame from "./chat/loading/TetrisLoadingGame";
 
 type View = "idle" | "sessions" | "chat";
 type TabId = "chat" | "violations";
+type LoadingGameKind = "dog" | "tetris";
 
 const fmtDate = (iso: string) => {
   if (!iso) return "";
@@ -33,8 +36,61 @@ const fmtDate = (iso: string) => {
   }
 };
 
+const isStartReviewNotFound = (error: unknown) =>
+  (error as any)?.response?.status === 404;
+
+const startReviewErrorDetail = (error: unknown) => {
+  const detail = (error as any)?.response?.data?.detail;
+  return typeof detail === "string" && detail.trim() ? detail.trim() : "";
+};
+
+const DOCUMENT_API_BASE =
+  ((import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "") ||
+    "http://localhost:8000") + "/api/v1/documents";
+const PROJECT_ID_STORAGE_KEY = "skn23_current_project_id";
+
+const filterExistingTempSpecIds = async (ids: string[]) => {
+  const orgId = localStorage.getItem("skn23_org_id") || "";
+  if (localStorage.getItem("skn23_api_key_registered") !== "true") return [];
+  const uniqueIds = [...new Set(ids.map((id) => id.trim()).filter(Boolean))];
+  if (!orgId || uniqueIds.length === 0) return [];
+
+  try {
+    const res = await fetch(`${DOCUMENT_API_BASE}/temp?org_id=${encodeURIComponent(orgId)}`, {
+      headers: { ...getDocumentApiHeaders() },
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    const existing = new Set(
+      (data.documents || []).map((doc: { id?: unknown }) => String(doc.id || "")),
+    );
+    return uniqueIds.filter((id) => existing.has(id));
+  } catch {
+    return [];
+  }
+};
+
+const fetchProjectTempSpecIds = async (projectId: string) => {
+  const orgId = localStorage.getItem("skn23_org_id") || "";
+  if (localStorage.getItem("skn23_api_key_registered") !== "true") return [];
+  if (!orgId || !projectId) return [];
+  try {
+    const res = await fetch(
+      `${DOCUMENT_API_BASE}/temp/projects/${encodeURIComponent(projectId)}/specs?org_id=${encodeURIComponent(orgId)}`,
+      { headers: { ...getDocumentApiHeaders() } },
+    );
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data.documents || [])
+      .map((doc: { temp_document_id?: unknown }) => String(doc.temp_document_id || ""))
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+};
+
 export default function ChatApp() {
-  const { sendMessage, isConnected } = useSocket();
+  const { sendMessage, isConnected, connectionStatus, viewCenter } = useSocket();
   const {
     messages: chat,
     reviewResults: violations,
@@ -43,7 +99,7 @@ export default function ChatApp() {
     addMessage,
     setMessages,
     clearResults,
-    clearCadUnmapped,
+    clearCadSessionId,
     activeObjectIds,
     selectedSpecIds,
     selectedTempSpecIds,
@@ -53,6 +109,10 @@ export default function ChatApp() {
     clearDomainMismatch,
     progressLine,
     setActiveObjectIds,
+    drawingState,
+    fileFingerprint,
+    pendingCreationProposals,
+    removeCreationProposal,
   } = useAgentStore();
 
   const [view, setView] = useState<View>("idle");
@@ -66,18 +126,62 @@ export default function ChatApp() {
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [showApiAlert, setShowApiAlert] = useState(false);
   const [showDomainDropdown, setShowDomainDropdown] = useState(false);
-  const [unmappedModalDismissed, setUnmappedModalDismissed] = useState(false);
   const [buttonReviewing, setButtonReviewing] = useState(false);
   const [chatGenerating, setChatGenerating] = useState(false);
+  const [loadingGameKind, setLoadingGameKind] = useState<LoadingGameKind>("dog");
+  const [loadingGameOpen, setLoadingGameOpen] = useState(false);
   const [loadingDots, setLoadingDots] = useState("");
 
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const chatRequestIdRef = useRef(0);
+  const sessionIdRef = useRef("");
+  const prevLoadingGameActiveRef = useRef(false);
+  const reviewTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingReviewRef = useRef<{
     domain: string;
     mode: "KEC_ONLY" | "HYBRID";
     prompt: string;
   } | null>(null);
+  // drawingReviewBlocked 해제 시 자동 검토 시작을 위한 펜딩 파라미터
+  const pendingReviewOnReadyRef = useRef<{
+    domain: string;
+    mode: "KEC_ONLY" | "HYBRID";
+    prompt: string;
+  } | null>(null);
+  const pendingReviewNoticeIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    sessionIdRef.current = sessionId;
+  }, [sessionId]);
+
+  const pushAgent = useCallback((txt: string) => {
+    addMessage({ id: Date.now().toString(), sender: "agent", text: txt, timestamp: new Date().toISOString() });
+  }, [addMessage]);
+
+  const upsertAgentNotice = useCallback((id: string, txt: string) => {
+    const timestamp = new Date().toISOString();
+    const messages = useAgentStore.getState().messages;
+    if (messages.some((m) => m.id === id)) {
+      setMessages(
+        messages.map((m) =>
+          m.id === id ? { ...m, text: txt, timestamp, ts: Date.now() } : m,
+        ),
+      );
+      return;
+    }
+    addMessage({ id, sender: "agent", text: txt, timestamp, ts: Date.now() });
+  }, [addMessage, setMessages]);
+
+  const clearReviewTimeout = useCallback(() => {
+    if (reviewTimeoutRef.current !== null) {
+      clearTimeout(reviewTimeoutRef.current);
+      reviewTimeoutRef.current = null;
+    }
+  }, []);
+
+  const armReviewTimeout = useCallback(() => {
+    clearReviewTimeout();
+  }, [clearReviewTimeout]);
 
   const pendingFixCount = (violations as any[]).filter(
     (v) =>
@@ -86,31 +190,29 @@ export default function ChatApp() {
       !resolved.has(String(v.violation.id)),
   ).length;
   const selectedObjectCount = activeObjectIds?.length || 0;
-  const domainMismatchConfidence =
-    domainMismatch
-      ? domainMismatch.probabilities?.[domainMismatch.predicted_domain]
-      : undefined;
-  const domainMismatchPercent =
-    typeof domainMismatchConfidence === "number" &&
-    Number.isFinite(domainMismatchConfidence)
-      ? ` (${(domainMismatchConfidence * 100).toFixed(1)}%)`
-      : "";
+  const loadingGameActive = reviewing || chatGenerating;
+  const drawingReviewBlocked =
+    drawingState?.changeMode === "INCREMENTAL_PENDING" ||
+    drawingState?.changeMode === "FULL_RESYNC_PENDING" ||
+    drawingState?.changeMode === "FULL_RESYNC_RUNNING" ||
+    drawingState?.status === "INCREMENTAL_PENDING" ||
+    drawingState?.status === "FULL_RESYNC_PENDING" ||
+    drawingState?.status === "FULL_RESYNC_RUNNING" ||
+    (drawingState?.status === "RESYNC_FAILED" && !drawingState.canReviewStaleSnapshot);
+  const reviewButtonDisabled = !isConnected;
 
-  const isApiRegistered = () => localStorage.getItem("skn23_api_key_registered") === "true";
+  const isApiRegistered = () => isAgentApiRegistered();
 
   useEffect(() => {
     if (view !== "chat" || activeTab !== "chat") return;
     const el = chatScrollRef.current;
     if (!el) return;
+    el.scrollTop = el.scrollHeight;
     const t = requestAnimationFrame(() => {
       el.scrollTop = el.scrollHeight;
     });
     return () => cancelAnimationFrame(t);
-  }, [view, activeTab, chat, reviewing, progressLine]);
-
-  useEffect(() => {
-    setUnmappedModalDismissed(false);
-  }, [cadEvent?.sessionId, cadEvent?.ts, (cadEvent?.unmappedLayers ?? []).join("\u0000")]);
+  }, [view, activeTab, chat, reviewing, chatGenerating, progressLine]);
 
   // 분석 중 마침표 애니메이션 로직
   useEffect(() => {
@@ -125,24 +227,45 @@ export default function ChatApp() {
   }, [buttonReviewing]);
 
   useEffect(() => {
+    if (loadingGameActive && !prevLoadingGameActiveRef.current) {
+      setLoadingGameKind(Math.random() < 0.5 ? "dog" : "tetris");
+      setLoadingGameOpen(false);
+    }
+    if (!loadingGameActive) {
+      setLoadingGameOpen(false);
+    }
+    prevLoadingGameActiveRef.current = loadingGameActive;
+  }, [loadingGameActive]);
+
+  useEffect(() => {
     if (view === "sessions") {
       setActiveObjectIds([], "full");
     }
   }, [view, setActiveObjectIds]);
 
-  const showUnmappedModal = (cadEvent?.unmappedLayers?.length ?? 0) > 0 && !unmappedModalDismissed;
-
   useEffect(() => {
     if (!reviewing) {
+      pendingReviewRef.current = null;
       setButtonReviewing(false);
       setChatGenerating(false);
+      clearReviewTimeout();
     }
-  }, [reviewing]);
+  }, [reviewing, clearReviewTimeout]);
+
+  useEffect(() => {
+    if (!reviewing || !progressLine?.message) return;
+    armReviewTimeout();
+  }, [reviewing, progressLine?.message, progressLine?.stage, progressLine?.totalMs, armReviewTimeout]);
 
   const clearReviewUiFully = useCallback(() => {
+    pendingReviewRef.current = null;
+    pendingReviewOnReadyRef.current = null;
+    pendingReviewNoticeIdRef.current = null;
     clearResults();
     setResolved(new Set());
     setActiveTab("chat");
+    setButtonReviewing(false);
+    setChatGenerating(false);
     if (window.chrome?.webview) {
       try {
         window.chrome.webview.postMessage(JSON.stringify({ action: "CLEAR_CAD_REVIEW" }));
@@ -150,6 +273,11 @@ export default function ChatApp() {
       } catch { }
     }
   }, [clearResults]);
+
+  const clearProjectSpecLinkState = useCallback(() => {
+    localStorage.removeItem(PROJECT_ID_STORAGE_KEY);
+    setSelectedTempSpecIds([]);
+  }, [setSelectedTempSpecIds]);
 
   const handleClearSelection = useCallback(() => {
     setActiveObjectIds([], "full");
@@ -162,35 +290,30 @@ export default function ChatApp() {
 
   const openAgent = useCallback(
     async (id: string, file: string) => {
-      if (!localStorage.getItem("skn23_api_key_registered")) {
+      if (!isApiRegistered()) {
         setShowApiAlert(true);
         return;
       }
       setAgent(id);
       setDwg(file);
       clearReviewUiFully();
+      setSelectedTempSpecIds([]);
       
       // 즉시 채팅창으로 이동하여 체감 속도 향상
       setView("chat");
       setInput("");
       setMessages([]);
 
-      // 백그라운드에서 세션 로드 및 생성
+      // 세션 목록만 로드 (세션은 첫 메시지/분석 시 생성)
+      setSessionId("");
       try {
         const list = await fetchSessionList(id).catch(() => []);
         setSessions(list);
-        const ns = await createSession(id, file).catch(() => null);
-        if (ns) {
-          setSessionId(ns.id);
-          setSessions((p) => [ns, ...p]);
-        } else {
-          setSessionId("");
-        }
       } catch (e) {
-        console.error("세션 초기화 실패:", e);
+        console.error("세션 목록 로드 실패:", e);
       }
     },
-    [clearReviewUiFully, setMessages],
+    [clearReviewUiFully, setMessages, setSelectedTempSpecIds],
   );
 
   useEffect(() => {
@@ -212,6 +335,7 @@ export default function ChatApp() {
         const msg = JSON.parse((event as any).data);
         if (msg.action === "OPEN_AGENT") openAgent(msg.payload.agent, msg.payload.dwg);
         if (msg.action === "DWG_CHANGED") {
+          clearProjectSpecLinkState();
           const nextDwg = String(msg.payload?.dwg || "").trim();
           if (nextDwg) setDwg(nextDwg);
         }
@@ -221,14 +345,37 @@ export default function ChatApp() {
           localStorage.setItem("skn23_os_user", msg.payload.os_user || "");
           sendSessionInfoToCSharp();
         }
-        if (msg.action === "TEMP_SPEC_LINK_LOADED" && Array.isArray(msg.payload?.documents)) {
+        if (msg.action === "TEMP_SPEC_LINK_LOADED") {
           const org = localStorage.getItem("skn23_org_id") || "";
           const payloadOrg = msg.payload.org_id as string | undefined;
-          if (payloadOrg && org && payloadOrg !== org) return;
+          if (payloadOrg && org && payloadOrg !== org) {
+            clearProjectSpecLinkState();
+            return;
+          }
+          if (localStorage.getItem("skn23_api_key_registered") !== "true" || !org) {
+            clearProjectSpecLinkState();
+            return;
+          }
+          const projectId = String(msg.payload?.project_id || "").trim();
+          if (projectId) {
+            localStorage.setItem(PROJECT_ID_STORAGE_KEY, projectId);
+            void fetchProjectTempSpecIds(projectId).then((ids) => {
+              setSelectedTempSpecIds(ids);
+            });
+            return;
+          }
+          if (!Array.isArray(msg.payload?.documents)) return;
           const ids = (msg.payload.documents as { temp_document_id?: string }[])
             .map((d) => d.temp_document_id)
             .filter((id): id is string => !!id);
-          setSelectedTempSpecIds(ids);
+          if (ids.length === 0) {
+            setSelectedTempSpecIds([]);
+            return;
+          }
+          void filterExistingTempSpecIds(ids).then(setSelectedTempSpecIds);
+        }
+        if (msg.action === "TEMP_SPEC_LINK_CLEARED") {
+          clearProjectSpecLinkState();
         }
         if (msg.action === "CAD_ANALYZE_COMPLETE" && msg.session_id) {
           const id = String(msg.session_id).trim();
@@ -250,6 +397,13 @@ export default function ChatApp() {
             : [];
           useAgentStore.getState().setActiveObjectIds(ids, "focus");
         }
+        if (msg.action === "SHOW_VIOLATION_DETAIL") {
+          const vid = msg.payload?.violation_id;
+          if (vid) {
+            (useAgentStore.getState() as any).setSelectedViolationId?.(String(vid));
+            setActiveTab("violations");
+          }
+        }
       } catch { }
     };
 
@@ -259,7 +413,7 @@ export default function ChatApp() {
       sendSessionInfoToCSharp();
     }
     return () => window.chrome?.webview?.removeEventListener("message", handleCSharpMessage);
-  }, [openAgent, setSelectedTempSpecIds]);
+  }, [clearProjectSpecLinkState, openAgent, setSelectedTempSpecIds]);
 
   const pickSession = useCallback(
     async (sid: string) => {
@@ -313,12 +467,6 @@ export default function ChatApp() {
           sid = ns.id;
           setSessionId(sid);
           setSessions((p) => [ns, ...p]);
-          addMessage({
-            id: Date.now().toString(),
-            sender: "agent",
-            text: "새 대화가 시작되었습니다.",
-            timestamp: new Date().toISOString(),
-          });
         } catch (e) {
           console.error("세션 생성 실패:", e);
           // 실패 시 sid는 ""로 유지됨
@@ -357,6 +505,7 @@ export default function ChatApp() {
         session_id: sid,
         active_object_ids: activeObjectIds,
         cad_session_id: cadSid,
+        ...(viewCenter ? { view_center_x: viewCenter.x, view_center_y: viewCenter.y } : {}),
       });
     },
     [
@@ -371,12 +520,10 @@ export default function ChatApp() {
     ],
   );
 
-  const pushAgent = (txt: string) => {
-    addMessage({ id: Date.now().toString(), sender: "agent", text: txt, timestamp: new Date().toISOString() });
-  };
-
   const cancelReview = useCallback(() => {
     pendingReviewRef.current = null;
+    pendingReviewOnReadyRef.current = null;
+    pendingReviewNoticeIdRef.current = null;
     let cadSid = (cadEvent?.sessionId || "").trim();
     if (!cadSid) {
       try {
@@ -416,35 +563,67 @@ export default function ChatApp() {
     if (!cadEvent || !pendingReviewRef.current) return;
     const { domain, mode, prompt } = pendingReviewRef.current;
     pendingReviewRef.current = null;
-    const sid = sessionId || cadEvent.sessionId;
     const cadCacheId = cadEvent.sessionId;
-    if (!sessionId) setSessionId(sid);
-    agentApi
-      .startReview({
-        sessionId: sid,
-        cadCacheId,
-        domain,
-        activeObjectIds: activeObjectIds,
-        reviewMode: mode,
-        userPrompt: prompt,
-        specDocumentIds: selectedSpecIds,
-        tempSpecIds: selectedTempSpecIds,
-        orgId: localStorage.getItem("skn23_org_id") || "",
-      })
-      .catch(() => {
-        pushAgent("분석 요청 중 오류가 발생했습니다.");
-        setAnalyzing(false);
-      });
+
+    const doReview = async () => {
+      let sid = sessionId;
+      if (!sid) {
+        try {
+          const ns = await createSession(agent, dwg);
+          sid = ns.id;
+          setSessionId(sid);
+          setSessions((p) => [ns, ...p]);
+        } catch {
+          pushAgent("세션 생성에 실패했습니다.");
+          setAnalyzing(false);
+          return;
+        }
+      }
+      const latestStore = useAgentStore.getState();
+      const requestSpecIds = latestStore.selectedSpecIds;
+      const requestTempSpecIds = latestStore.selectedTempSpecIds;
+      const requestProjectId = localStorage.getItem(PROJECT_ID_STORAGE_KEY) || "";
+      agentApi
+        .startReview({
+          sessionId: sid,
+          cadCacheId,
+          drawingId: drawingState?.drawingId || undefined,
+          fileFingerprint: fileFingerprint || undefined,
+          domain,
+          activeObjectIds: activeObjectIds,
+          reviewMode: mode,
+          userPrompt: prompt,
+          specDocumentIds: requestSpecIds,
+          tempSpecIds: requestTempSpecIds,
+          projectId: requestProjectId || undefined,
+          orgId: localStorage.getItem("skn23_org_id") || "",
+        })
+        .catch((error) => {
+          if (requestTempSpecIds.length > 0 && isStartReviewNotFound(error)) {
+            setSelectedTempSpecIds([]);
+            pushAgent("선택된 임시 시방서를 찾을 수 없어 시방서 선택을 해제했습니다. 다시 검토를 실행해 주세요.");
+          } else {
+            pushAgent("분석 요청 중 오류가 발생했습니다.");
+          }
+          setAnalyzing(false);
+        });
+      armReviewTimeout();
+    };
+    doReview();
   }, [
     cadEvent,
     sessionId,
+    agent,
+    dwg,
     activeObjectIds,
     selectedSpecIds,
     selectedTempSpecIds,
+    setSelectedTempSpecIds,
     setAnalyzing,
+    clearCadSessionId,
   ]);
 
-  const runDrawReviewExtract = () => {
+  const runDrawReviewExtract = async (preferredSessionId?: string) => {
     const domainMap: Record<string, string> = {
       전기: "elec",
       배관: "pipe",
@@ -452,7 +631,11 @@ export default function ChatApp() {
       소방: "fire",
     };
     const domainCode = domainMap[agent] || "elec";
-    const hasSpecs = selectedSpecIds.length > 0 || selectedTempSpecIds.length > 0;
+    const latestStore = useAgentStore.getState();
+    const requestSpecIds = latestStore.selectedSpecIds;
+    const requestTempSpecIds = latestStore.selectedTempSpecIds;
+    const requestProjectId = localStorage.getItem(PROJECT_ID_STORAGE_KEY) || "";
+    const hasSpecs = requestSpecIds.length > 0 || requestTempSpecIds.length > 0 || !!requestProjectId;
     const mode = hasSpecs ? "HYBRID" : "KEC_ONLY";
     const nSel = activeObjectIds?.length || 0;
     const defaultReview =
@@ -460,48 +643,162 @@ export default function ChatApp() {
         ? `CAD에서 선택한 ${nSel}개 객체에 대해 시방·규정 위반이 있는지 검토해 주세요.`
         : "도면 전체에 대해 시방·규정 위반을 전수 검토해 주세요.";
 
-    pendingReviewRef.current = {
-      domain: domainCode,
-      mode,
-      prompt: defaultReview,
-    };
-    setButtonReviewing(true);
-    setAnalyzing(true);
+    if (drawingReviewBlocked) {
+      pendingReviewOnReadyRef.current = { domain: domainCode, mode, prompt: defaultReview };
+      const noticeId = pendingReviewNoticeIdRef.current ?? `review-wait-${Date.now()}`;
+      pendingReviewNoticeIdRef.current = noticeId;
+      setButtonReviewing(true);
+      setAnalyzing(true);
+      upsertAgentNotice(
+        noticeId,
+        "도면 변경사항 저장 또는 재동기화가 진행 중입니다. 완료되면 자동으로 검토를 시작합니다.",
+      );
+      return;
+    }
+
     clearResults();
     setResolved(new Set());
     setActiveTab("chat");
+    setButtonReviewing(true);
+    setAnalyzing(true);
     if (window.chrome?.webview) {
       try {
         window.chrome.webview.postMessage(JSON.stringify({ action: "CLEAR_CAD_REVIEW" }));
       } catch { }
     }
-    sendMessage("EXTRACT_DATA", { domain: domainCode });
+
+    if (
+      drawingState?.changeMode === "FULL_RESYNC_PENDING" ||
+      drawingState?.changeMode === "FULL_RESYNC_RUNNING"
+    ) {
+      pushAgent("도면 전체 재동기화가 필요하거나 진행 중입니다. 완료 후 다시 검토해 주세요.");
+      setAnalyzing(false);
+      setButtonReviewing(false);
+      return;
+    }
+
+    const canSkipExtract =
+      drawingState?.drawingId &&
+      drawingState?.currentSnapshotId &&
+      drawingState.status !== "DIRTY" &&
+      drawingState.status !== "INCREMENTAL_PENDING" &&
+      drawingState.status !== "FULL_RESYNC_PENDING" &&
+      drawingState.status !== "FULL_RESYNC_RUNNING" &&
+      drawingState.changeMode !== "INCREMENTAL_PENDING" &&
+      drawingState.changeMode !== "FULL_RESYNC_PENDING" &&
+      drawingState.changeMode !== "FULL_RESYNC_RUNNING";
+
+    if (canSkipExtract) {
+      // S3에 snapshot이 있으므로 CAD 재추출 없이 바로 검토 요청
+      let sid = (preferredSessionId || sessionId || "").trim();
+      if (!sid) {
+        try {
+          const ns = await createSession(agent, dwg);
+          sid = ns.id;
+          setSessionId(sid);
+          setSessions((p) => [ns, ...p]);
+        } catch {
+          pushAgent("세션 생성에 실패했습니다.");
+          setButtonReviewing(false);
+          setAnalyzing(false);
+          return;
+        }
+      }
+      const orgId = localStorage.getItem("skn23_org_id") || "";
+      agentApi.startReview({
+        sessionId: sid,
+        cadCacheId: cadEvent?.sessionId || undefined,
+        drawingId: drawingState!.drawingId,
+        fileFingerprint: fileFingerprint || undefined,
+        domain: domainCode,
+        activeObjectIds,
+        reviewMode: mode,
+        userPrompt: defaultReview,
+        specDocumentIds: requestSpecIds,
+        tempSpecIds: requestTempSpecIds,
+        projectId: requestProjectId || undefined,
+        orgId,
+      }).catch((error) => {
+        const detail = startReviewErrorDetail(error);
+        pushAgent(detail ? `분석 요청 중 오류가 발생했습니다: ${detail}` : "분석 요청 중 오류가 발생했습니다.");
+        setButtonReviewing(false);
+        setAnalyzing(false);
+      });
+      // Keep a stall guard, but refresh it whenever backend progress arrives.
+      armReviewTimeout();
+    } else {
+      // snapshot 없음 → CAD 전체 추출 필요
+      pendingReviewRef.current = { domain: domainCode, mode, prompt: defaultReview };
+      clearCadSessionId();
+      sendMessage("EXTRACT_DATA", { domain: domainCode });
+    }
   };
 
-  const handleDomainContinue = () => {
+  useEffect(() => {
+    if (drawingReviewBlocked || !pendingReviewOnReadyRef.current) return;
+    pendingReviewNoticeIdRef.current = null;
+    pendingReviewOnReadyRef.current = null;
+    void runDrawReviewExtract(sessionId);
+  }, [
+    drawingReviewBlocked,
+    drawingState?.changeMode,
+    drawingState?.status,
+    drawingState?.currentSnapshotId,
+    sessionId,
+  ]);
+
+  const handleDomainContinue = async () => {
     if (!domainMismatch) return;
     clearDomainMismatch();
+    clearResults();
+    setResolved(new Set());
     setButtonReviewing(true);
     setAnalyzing(true);
     pushAgent(`${domainMismatch.original_domain_kr} 에이전트로 계속 진행합니다...`);
 
-    const sid = sessionId || (cadEvent?.sessionId ?? "");
-    const cadCacheId = cadEvent?.sessionId || sid;
+    let sid = sessionId;
+    if (!sid) {
+      try {
+        const ns = await createSession(agent, dwg);
+        sid = ns.id;
+        setSessionId(sid);
+        setSessions((p) => [ns, ...p]);
+      } catch {
+        pushAgent("세션 생성에 실패했습니다.");
+        setButtonReviewing(false);
+        setAnalyzing(false);
+        return;
+      }
+    }
+    const cadCacheId = cadEvent?.sessionId ?? "";
+    const latestStore = useAgentStore.getState();
+    const requestSpecIds = latestStore.selectedSpecIds;
+    const requestTempSpecIds = latestStore.selectedTempSpecIds;
+    const requestProjectId = localStorage.getItem(PROJECT_ID_STORAGE_KEY) || "";
     agentApi
       .confirmReview({
         sessionId: sid,
         cadCacheId,
+        drawingId: drawingState?.drawingId || undefined,
+        fileFingerprint: fileFingerprint || undefined,
         domain: domainMismatch.original_domain,
         activeObjectIds,
-        reviewMode: (selectedSpecIds.length > 0 || selectedTempSpecIds.length > 0) ? "HYBRID" : "KEC_ONLY",
-        specDocumentIds: selectedSpecIds,
-        tempSpecIds: selectedTempSpecIds,
+        reviewMode: (requestSpecIds.length > 0 || requestTempSpecIds.length > 0 || !!requestProjectId) ? "HYBRID" : "KEC_ONLY",
+        specDocumentIds: requestSpecIds,
+        tempSpecIds: requestTempSpecIds,
+        projectId: requestProjectId || undefined,
         orgId: localStorage.getItem("skn23_org_id") || "",
       })
-      .catch(() => {
-        pushAgent("분석 요청 중 오류가 발생했습니다.");
+      .catch((error) => {
+        if (requestTempSpecIds.length > 0 && isStartReviewNotFound(error)) {
+          setSelectedTempSpecIds([]);
+          pushAgent("선택된 임시 시방서를 찾을 수 없어 시방서 선택을 해제했습니다. 다시 검토를 실행해 주세요.");
+        } else {
+          pushAgent("분석 요청 중 오류가 발생했습니다.");
+        }
         setAnalyzing(false);
       });
+    armReviewTimeout();
   };
 
   const handleDomainReselect = () => {
@@ -512,20 +809,14 @@ export default function ChatApp() {
   const newSession = async () => {
     if (!isApiRegistered()) { setShowApiAlert(true); return; }
     if (!agent || agent === "자유질의") {
-      // 에이전트가 없으면 홈으로 이동 유도
       setView("idle");
       return;
     }
-    try {
-      const ns = await createSession(agent, dwg);
-      setSessionId(ns.id);
-      setSessions((p) => [ns, ...p]);
-    } catch (e) {
-      console.error("New session failed:", e);
-    }
-    
+    // 세션은 첫 메시지/분석 시 생성 — 여기서는 UI만 초기화
+    setSessionId("");
     setInput("");
     clearReviewUiFully();
+    setSelectedTempSpecIds([]);
     setMessages([]);
     setView("chat");
   };
@@ -536,12 +827,14 @@ export default function ChatApp() {
     if (!isConnected) return;
     if (!agent || agent === "자유질의") return;
     const ns = await createSession(agent, dwg);
+    sessionIdRef.current = ns.id;
     setSessionId(ns.id);
     setSessions((p) => [ns, ...p]);
     clearReviewUiFully();
+    setSelectedTempSpecIds([]);
     setMessages([]);
     setView("chat");
-    runDrawReviewExtract();
+    void runDrawReviewExtract(ns.id);
   };
 
   const startReview = async (fromListSessionId?: string) => {
@@ -566,7 +859,7 @@ export default function ChatApp() {
       }
       setView("chat");
     }
-    runDrawReviewExtract();
+    void runDrawReviewExtract(fromListSessionId || sessionId);
   };
 
   const getViolationId = (item: any) =>
@@ -601,6 +894,16 @@ export default function ChatApp() {
     }
   };
 
+  const approveProposal = (proposalId: string) => {
+    sendMessage("APPROVE_ENTITY", { proposal_id: proposalId });
+    removeCreationProposal(proposalId);
+  };
+
+  const rejectProposal = (proposalId: string, handles: string[]) => {
+    sendMessage("REJECT_ENTITY", { proposal_id: proposalId, handles });
+    removeCreationProposal(proposalId);
+  };
+
   const reject = async (vid: string) => {
     try {
       if (vid === "ALL" && sessionId) {
@@ -620,7 +923,7 @@ export default function ChatApp() {
         setResolved((p) => new Set([...p, String(vid)]));
       }
     } catch (error) {
-      console.error("수정 제안 무시 중 오류 발생:", error);
+      console.error("거부 처리 중 오류 발생:", error);
       alert("서버에 결과를 저장하는 중 문제가 발생했습니다.");
     }
   };
@@ -682,22 +985,6 @@ export default function ChatApp() {
         </div>
       )}
 
-      <UnmappedLayersModal
-        open={showUnmappedModal}
-        onClose={() => setUnmappedModalDismissed(true)}
-        layerNames={cadEvent?.unmappedLayers || []}
-        onSaved={() => {
-          clearCadUnmapped();
-          addMessage({
-            id: Date.now().toString(),
-            sender: "agent",
-            text: "선택하신 레이어·블록명 매핑을 저장했습니다. 분석을 이어서 진행합니다.",
-          });
-          // 매핑 저장 후 자동으로 분석 재시작
-          runDrawReviewExtract();
-        }}
-      />
-
       {view === "idle" && (
         <div className="flex min-h-0 flex-1 flex-col">
           <div className="min-h-0 flex-1">
@@ -715,6 +1002,8 @@ export default function ChatApp() {
             onAgentChange={(id: string) => openAgent(id, dwg)}
             onClearSelection={handleClearSelection}
             onNewChat={() => void newSession()}
+            isConnected={isConnected}
+            connectionStatus={connectionStatus}
           />
           <div className="flex-1 overflow-y-auto px-3 py-3 space-y-2">
             {sessions.length === 0 && (
@@ -785,6 +1074,7 @@ export default function ChatApp() {
             }}
             onNewChat={() => void newSession()}
             isConnected={isConnected}
+            connectionStatus={connectionStatus}
           />
           <TabBar 
             activeTab={activeTab} 
@@ -795,7 +1085,7 @@ export default function ChatApp() {
           />
           <div ref={chatScrollRef} className="flex-1 overflow-y-auto min-h-0 relative">
             {/* CHAT TAB */}
-            <div className={`flex flex-col gap-4 px-3.5 py-5 max-w-3xl w-full mx-auto ${activeTab !== "chat" ? "hidden" : ""}`}>
+            <div className={`flex w-full flex-col gap-4 px-3.5 py-5 ${activeTab !== "chat" ? "hidden" : ""}`}>
               {pendingFixCount > 0 && (
                 <div className="rounded-xl border border-blue-500/30 bg-blue-500/10 p-4 space-y-3 shadow-lg shadow-blue-500/5">
                   <p className="text-sm text-blue-200">
@@ -812,11 +1102,57 @@ export default function ChatApp() {
                 </div>
               )}
               {chat.map((m, i) => (
-                <ChatMessageRow key={`${m.id}-${i}`} message={m} />
+                <ChatMessageRow
+                  key={`${m.id}-${i}`}
+                  message={m}
+                  onSuggestQuery={(query) => void send(query)}
+                />
               ))}
               {reviewing && (
                 <div className="px-2" aria-live="polite">
                   <ChatStatusStrip agentName={agent} />
+                </div>
+              )}
+              {loadingGameActive && (
+                <div className="px-6">
+                  <div className="rounded-lg border border-slate-800/70 bg-slate-950/20 px-3 py-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span className="h-2 w-2 rounded-full bg-orange-500 shadow-[0_0_10px_rgba(249,115,22,0.75)]" />
+                        <span className="truncate text-[12px] font-semibold text-orange-300">
+                          대기 게임
+                        </span>
+                        <span className="truncate text-[11px] text-slate-500">
+                          {loadingGameKind === "dog" ? "강아지 점프" : "테트리스"}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setLoadingGameOpen((value) => !value)}
+                        className="shrink-0 rounded-md border border-slate-700/70 bg-slate-900/60 px-2.5 py-1 text-[11px] font-medium text-slate-300 transition hover:border-slate-600 hover:bg-slate-800 hover:text-slate-100"
+                      >
+                        {loadingGameOpen ? "접기" : "게임 열기"}
+                      </button>
+                    </div>
+
+                    {loadingGameOpen && (
+                      <div className="mt-3">
+                        {loadingGameKind === "dog" ? (
+                          <DogLoadingGame
+                            active={loadingGameActive}
+                            title="강아지 점프"
+                            subtitle="Space로 점프하고 뼈다귀를 먹어 점수를 얻을 수 있습니다."
+                          />
+                        ) : (
+                          <TetrisLoadingGame
+                            active={loadingGameActive}
+                            title="테트리스"
+                            subtitle="방향키와 Space로 조작할 수 있습니다."
+                          />
+                        )}
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
               {domainMismatch && (
@@ -826,7 +1162,7 @@ export default function ChatApp() {
                   </p>
                   <p className="text-xs text-slate-400">
                     현재: <span className="text-white font-medium">{domainMismatch.original_domain_kr}</span>{" "}
-                    → AI 추천: <span className="text-yellow-300 font-bold">{domainMismatch.predicted_domain_kr}{domainMismatchPercent}</span>
+                    → AI 추천: <span className="text-yellow-300 font-bold">{domainMismatch.predicted_domain_kr} ({(domainMismatch.probabilities[domainMismatch.predicted_domain] * 100).toFixed(1)}%)</span>
                   </p>
                   <div className="flex gap-2 pt-1">
                     <button type="button" onClick={handleDomainReselect} className="flex-1 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-sm font-medium transition-colors border border-slate-700">재선택</button>
@@ -843,17 +1179,23 @@ export default function ChatApp() {
                 resolved={resolved}
                 onApprove={approve}
                 onReject={reject}
-                onZoom={(e: any) =>
+                onZoom={(e: any) => {
+                  const v = e?.violation || {};
+                  const violationType = String(v.violation_type || v.type || v.issue_type || "");
+                  const source = String(v._source || v.source || "");
                   sendMessage("ZOOM_TO_ENTITY", {
-                    session_id: sessionId,
-                    handle: e.handle,
-                    layer: e.layer,
-                    type: e.type,
-                    bbox: e.bbox,
-                  })
-                }
+                    handle: e?.handle,
+                    bbox: e?.bbox,
+                    violation_type: violationType,
+                    source,
+                    prefer_bbox: source === "drawing_qa" || violationType.startsWith("drawing_quality_"),
+                  });
+                }}
                 onApproveAll={() => approve("ALL")}
                 onRejectAll={() => reject("ALL")}
+                pendingProposals={pendingCreationProposals}
+                onApproveProposal={approveProposal}
+                onRejectProposal={rejectProposal}
               />
             </div>
           </div>
@@ -867,8 +1209,8 @@ export default function ChatApp() {
                         if (reviewing || buttonReviewing) cancelReview();
                         else startReview();
                       }}
-                      disabled={!isConnected}
-                      className="flex h-7 w-20 items-center justify-center gap-1.5 rounded-lg bg-[#0b4a94] px-3.5 text-center text-[13px] font-semibold text-white shadow-md transition-all hover:scale-[1.02] hover:bg-[#0d59b0] active:scale-95 disabled:pointer-events-none disabled:opacity-50"
+                      disabled={reviewButtonDisabled}
+                      className="flex h-7 min-w-20 items-center justify-center gap-1.5 rounded-lg bg-[#0b4a94] px-3.5 text-center text-[13px] font-semibold text-white shadow-md transition-all hover:scale-[1.02] hover:bg-[#0d59b0] active:scale-95 disabled:pointer-events-none disabled:opacity-50"
                     >
                       {reviewing || buttonReviewing
                         ? `분석중${selectedObjectCount > 0 ? `(${selectedObjectCount}개)` : ""}${loadingDots}`
@@ -877,7 +1219,7 @@ export default function ChatApp() {
                   )}
 
                   {selectedObjectCount > 0 && (
-                    <div className="flex h-7 w-auto items-center gap-1.5 rounded-lg border border-blue-500/30 bg-blue-500/10 px-2.5 animate-in fade-in zoom-in-95 duration-200">
+                    <div className="flex h-7 w-auto  items-center gap-1.5 rounded-lg border border-blue-500/30 bg-blue-500/10 px-2.5 animate-in fade-in zoom-in-95 duration-200">
                       <span className="text-[11px] text-blue-300 font-semibold">
                         {selectedObjectCount}개 선택됨
                       </span>
@@ -931,7 +1273,7 @@ export default function ChatApp() {
                 onKey={onKey}
                 onSend={() => send(input)}
                 onStop={cancelChatGeneration}
-                placeholder={isConnected ? "메시지를 입력하세요..." : "서버 연결 중..."}
+                placeholder={isConnected ? "메시지를 입력하세요..." : "서버 연결 실패"}
                 disabled={!isConnected}
                 loading={chatGenerating}
               />

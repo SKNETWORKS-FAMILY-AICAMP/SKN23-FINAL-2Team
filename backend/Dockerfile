@@ -13,15 +13,14 @@ ENV PYTHONPATH=/app
 
 # HuggingFace 모델 캐시 경로 — docker-compose에서 ./models 볼륨을 /app/models 에 마운트
 ENV HF_HOME=/app/models
-ENV HF_HUB_OFFLINE=1
-ENV TRANSFORMERS_OFFLINE=1
+# 오프라인 모드는 docker-compose.yml 에서 제어 (기본: 꺼짐 → 모델 자동 다운로드 허용)
 
 # 모델 디렉터리 생성 (볼륨 마운트 전 기본 경로 보장)
 RUN mkdir -p /app/models
 
 RUN pip install --no-cache-dir uv
 
-COPY backend/requirements.txt /app/requirements.txt
+COPY requirements.txt /app/requirements.txt
 RUN uv pip install --system --no-cache -r /app/requirements.txt
 
 COPY backend /app/backend
