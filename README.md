@@ -27,9 +27,6 @@
          <img src="./frontend/src/assets/rm/d.png" width ="100%" >
       </td>
       <td width="20%" align="center" style="border: 1px solid #ddd; padding: 10px; vertical-align: middle;">
-        <img src="./frontend/src/assets/rm/e.png" width ="100%" >
-      </td>
-      <td width="20%" align="center" style="border: 1px solid #ddd; padding: 10px; vertical-align: middle;">
          <img src="./frontend/src/assets/rm/a.png" width ="100%" >
       </td>
       <td width="20%" align="center" style="border: 1px solid #ddd; padding: 10px; vertical-align: middle;">
@@ -39,14 +36,12 @@
   <tr style="background-color: #f9f9f9; font-weight: bold;">
     <td style="border: 1px solid #ddd; padding: 8px;">양창일</td>
     <td style="border: 1px solid #ddd; padding: 8px;">김다빈</td>
-    <td style="border: 1px solid #ddd; padding: 8px;">김민정</td>
     <td style="border: 1px solid #ddd; padding: 8px;">김지우</td>
     <td style="border: 1px solid #ddd; padding: 8px;">송주엽</td>
   </tr>
   <tr style="background-color: #ffffff; font-weight: bold;">
     <td style="border: 1px solid #ddd; padding: 8px; color: #555;"><span style="font-size: 13px; font-weight: bold;">PM/AI/BE</span></td>
     <td style="border: 1px solid #ddd; padding: 8px; color: #555;"><span style="font-size: 13px; font-weight: bold;">APM/AI/BE</span></td>
-    <td style="border: 1px solid #ddd; padding: 8px; color: #555;"><span style="font-size: 13px; font-weight: bold;">AI/FE</span></td>
     <td style="border: 1px solid #ddd; padding: 8px; color: #555;"><span style="font-size: 13px; font-weight: bold;">AI/BE/FE</span></td>
     <td style="border: 1px solid #ddd; padding: 8px; color: #555;"><span style="font-size: 13px; font-weight: bold;">AI/BE/FE/Infra</span></td>
   </tr>
@@ -63,12 +58,6 @@
               - 건축 에이전트 설계<br>
               - Autocad Plugin 설계 및 구현<br>
               - 프로젝트 산출물 및 문서 총괄
-          </div>
-    </td>
-    <td style="border: 1px solid #ddd; padding: 12px 10px; color: #555; vertical-align: top;">
-          <div style="font-size: 10px; text-align: left; line-height: 1.5;">
-              - WEB UI/UX<br>
-              - 소방 에이전트 설계<br>
           </div>
     </td>
     <td style="border: 1px solid #ddd; padding: 12px 10px; color: #555; vertical-align: top;">
@@ -92,9 +81,6 @@
     </td>
     <td align="center" style="border: 1px solid #ddd; padding: 8px;">
         <a href="https://github.com/tree0327"><img src="https://img.shields.io/badge/GitHub-tree0327-pink?logo=github"></a>
-    </td>
-    <td align="center" style="border: 1px solid #ddd; padding: 8px;">
-        <a href="https://github.com/minjeong-kim-dev"><img src="https://img.shields.io/badge/GitHub-minjeong--kim--dev-orange?logo=github"></a>
     </td>
     <td align="center" style="border: 1px solid #ddd; padding: 8px;">
         <a href="https://github.com/jooooww"><img src="https://img.shields.io/badge/GitHub-jooooww-black?logo=github"></a>
